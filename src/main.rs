@@ -133,6 +133,13 @@ fn copy_to_clipboard(app: &mut App, text: &str) {
 fn save_file(app: &mut App) -> io::Result<()> {
     match app.file_path.clone() {
         Some(path) => {
+            if std::fs::metadata(&path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+            {
+                app.set_status("Cannot save: current path is a directory");
+                return Ok(());
+            }
             std::fs::write(&path, app.buffer.to_string())?;
             app.dirty = false;
             app.set_status(format!("Saved {path}"));
@@ -144,17 +151,47 @@ fn save_file(app: &mut App) -> io::Result<()> {
     Ok(())
 }
 
-/// 读取命令行参数里的文件路径；读不到文件内容时按「新文件」处理（保留路径，
-/// 这样之后用 `:w` 能把文件建出来）
+/// 读取命令行参数里的路径。
+///
+/// - 普通文件：读取文件内容；
+/// - 目录：把目录项转换成只读列表显示；
+/// - 不存在或无法读取的路径：按新文件处理，保留路径让 `:w` 可以创建它。
 fn load_file_arg() -> (Option<String>, String) {
     match std::env::args().nth(1) {
-        Some(path) => match std::fs::read_to_string(&path) {
-            Ok(content) => (Some(path), content),
+        Some(path) => match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => match directory_listing(&path) {
+                Ok(content) => (Some(path), content),
+                Err(err) => {
+                    eprintln!("Note: cannot list directory {path} ({err})");
+                    (Some(path), String::new())
+                }
+            },
+            Ok(_) => match std::fs::read_to_string(&path) {
+                Ok(content) => (Some(path), content),
+                Err(err) => {
+                    eprintln!("Note: cannot read {path} ({err}); opening as a new file");
+                    (Some(path), String::new())
+                }
+            },
             Err(err) => {
-                eprintln!("Note: cannot read {path} ({err}); opening as a new file");
+                eprintln!("Note: cannot access {path} ({err}); opening as a new file");
                 (Some(path), String::new())
             }
         },
         None => (None, String::new()),
     }
+}
+
+/// 生成目录浏览内容。目录项按名称排序，目录后附 `/` 便于区分。
+fn directory_listing(path: &str) -> io::Result<String> {
+    let mut entries = std::fs::read_dir(path)?
+        .map(|entry| {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let suffix = if entry.file_type()?.is_dir() { "/" } else { "" };
+            Ok(format!("{name}{suffix}"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|name| name.to_lowercase());
+    Ok(entries.join("\n"))
 }

@@ -22,7 +22,7 @@ pub enum EditorMode {
 }
 
 /// 默认的一次 Tab 缩进空格数（可用 `:set tabwidth N` 修改）
-const DEFAULT_TAB_WIDTH: usize = 4;
+const DEFAULT_TAB_WIDTH: usize = 8;
 
 /// 文本缓冲 —— 采用「行模型」：每一行是一个 String。
 ///
