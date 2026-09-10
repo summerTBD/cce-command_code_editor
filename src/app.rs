@@ -200,7 +200,7 @@ impl App {
             status_message: String::new(),
             dirty: false,
             file_path,
-            show_line_numbers: false,
+            show_line_numbers: true,
             tab_width: DEFAULT_TAB_WIDTH,
         }
     }
