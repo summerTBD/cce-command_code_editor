@@ -29,6 +29,8 @@ pub enum Action {
     SaveAndQuit,
     /// 把这段文本写入系统剪贴板
     Copy(String),
+    /// 打开另一个路径（文件或目录），由 main 读取后交给 App
+    OpenPath(String),
 }
 
 /// 主入口：根据「当前模式」分发这个按键该干什么。
@@ -284,6 +286,14 @@ fn execute_command(app: &mut App) -> Option<Action> {
             );
             None
         }
+        // ---- 打开路径 ----
+        // `:cce <path>`（`:open` / `:e` 为别名）：文件读内容，目录列子项。
+        // 读盘属于副作用，这里只产出 Action，真正的读取在 main.rs 里做。
+        ["cce", path] | ["open", path] | ["e", path] => Some(Action::OpenPath((*path).to_string())),
+        ["cce", ..] | ["open", ..] | ["e", ..] => {
+            app.set_status("Usage: cce <path> (aliases: open, e)");
+            None
+        }
 
         _ => {
             app.set_status(format!("Unknown command: {cmd}"));
@@ -411,7 +421,7 @@ fn delete_all_lines(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{Action, handle, handle_paste};
-    use crate::app::{App, Cursor, EditorMode};
+    use crate::app::{App, Cursor, DEFAULT_TAB_WIDTH, EditorMode};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     /// 模拟一次普通按键（无修饰、Press）
@@ -539,8 +549,9 @@ mod tests {
         let mut app = App::new();
         app.set_mode(EditorMode::Edit);
         run(&mut app, press(KeyCode::Tab));
-        assert_eq!(app.buffer.line(0), Some("    "));
-        assert_eq!(app.cursor.col, 4);
+        // 期望值跟着 app 的默认值走，避免以后改默认值又漏改测试
+        assert_eq!(app.buffer.line(0), Some(" ".repeat(DEFAULT_TAB_WIDTH).as_str()));
+        assert_eq!(app.cursor.col, DEFAULT_TAB_WIDTH);
         assert!(app.dirty);
     }
 
@@ -674,7 +685,7 @@ mod tests {
         app.command_input = "set tabwidth 0".to_string();
         run(&mut app, press(KeyCode::Enter));
         assert!(app.status_message.contains("Invalid tab width"));
-        assert_eq!(app.tab_width, 4); // 非法输入不改动原值
+        assert_eq!(app.tab_width, DEFAULT_TAB_WIDTH); // 非法输入不改动原值
     }
 
     #[test]
@@ -738,6 +749,46 @@ mod tests {
         app.command_input = "set  number".to_string();
         run(&mut app, press(KeyCode::Enter));
         assert!(app.show_line_numbers);
+    }
+
+    // ---------- 打开路径（:cce / :open / :e） ----------
+
+    #[test]
+    fn command_cce_requests_open_path() {
+        let mut app = App::from_content(None, "ab".to_string());
+        app.set_mode(EditorMode::Command);
+        app.command_input = "cce src/main.rs".to_string();
+        let action = run(&mut app, press(KeyCode::Enter));
+        assert_eq!(action, Some(Action::OpenPath("src/main.rs".to_string())));
+        // 打开是副作用：update 不能自己动内容
+        assert_eq!(app.buffer.line(0), Some("ab"));
+    }
+
+    #[test]
+    fn command_open_and_e_are_aliases() {
+        let mut app = App::new();
+        app.set_mode(EditorMode::Command);
+        app.command_input = "open README.md".to_string();
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            Some(Action::OpenPath("README.md".to_string()))
+        );
+
+        app.set_mode(EditorMode::Command);
+        app.command_input = "e Cargo.toml".to_string();
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            Some(Action::OpenPath("Cargo.toml".to_string()))
+        );
+    }
+
+    #[test]
+    fn command_cce_without_path_shows_usage() {
+        let mut app = App::new();
+        app.set_mode(EditorMode::Command);
+        app.command_input = "cce".to_string();
+        assert_eq!(run(&mut app, press(KeyCode::Enter)), None);
+        assert!(app.status_message.contains("Usage: cce"));
     }
 
     #[test]

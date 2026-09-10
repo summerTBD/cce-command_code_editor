@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 
 use cce::app::App;
 use cce::update::{self, Action};
-use cce::{event, ui};
+use cce::{event, file_io, ui};
 
 /// 我们用到的终端后端类型（Crossterm 输出到 stdout）
 type Backend = CrosstermBackend<io::Stdout>;
@@ -78,6 +78,7 @@ fn run(terminal: &mut Term, app: &mut App) -> io::Result<()> {
                             return Ok(());
                         }
                         Action::Copy(text) => copy_to_clipboard(app, &text),
+                        Action::OpenPath(path) => open_path(app, &path),
                     }
                 }
             }
@@ -154,27 +155,16 @@ fn save_file(app: &mut App) -> io::Result<()> {
 /// 读取命令行参数里的路径。
 ///
 /// - 普通文件：读取文件内容；
-/// - 目录：把目录项转换成只读列表显示；
+/// - 目录：列出直接子项；
 /// - 不存在或无法读取的路径：按新文件处理，保留路径让 `:w` 可以创建它。
+///
+/// 读取逻辑统一放在 `file_io`，这里只负责命令行这一层的错误提示。
 fn load_file_arg() -> (Option<String>, String) {
     match std::env::args().nth(1) {
-        Some(path) => match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => match directory_listing(&path) {
-                Ok(content) => (Some(path), content),
-                Err(err) => {
-                    eprintln!("Note: cannot list directory {path} ({err})");
-                    (Some(path), String::new())
-                }
-            },
-            Ok(_) => match std::fs::read_to_string(&path) {
-                Ok(content) => (Some(path), content),
-                Err(err) => {
-                    eprintln!("Note: cannot read {path} ({err}); opening as a new file");
-                    (Some(path), String::new())
-                }
-            },
+        Some(path) => match file_io::load_path(&path) {
+            Ok(content) => (Some(path), content),
             Err(err) => {
-                eprintln!("Note: cannot access {path} ({err}); opening as a new file");
+                eprintln!("Note: cannot open {path} ({err}); opening as a new file");
                 (Some(path), String::new())
             }
         },
@@ -182,16 +172,16 @@ fn load_file_arg() -> (Option<String>, String) {
     }
 }
 
-/// 生成目录浏览内容。目录项按名称排序，目录后附 `/` 便于区分。
-fn directory_listing(path: &str) -> io::Result<String> {
-    let mut entries = std::fs::read_dir(path)?
-        .map(|entry| {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let suffix = if entry.file_type()?.is_dir() { "/" } else { "" };
-            Ok(format!("{name}{suffix}"))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|name| name.to_lowercase());
-    Ok(entries.join("\n"))
+/// 执行打开动作（由 update 返回 `Action::OpenPath` 后触发）。
+///
+/// 路径可以是文件也可以是目录。读取失败时只改状态栏，
+/// 不破坏当前已经打开的内容（这比先清空再报错安全）。
+fn open_path(app: &mut App, path: &str) {
+    match file_io::load_path(path) {
+        Ok(content) => {
+            app.replace_document(path.to_string(), content);
+            app.set_status(format!("Opened {path}"));
+        }
+        Err(err) => app.set_status(format!("Open failed: {err}")),
+    }
 }

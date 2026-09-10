@@ -22,7 +22,7 @@ pub enum EditorMode {
 }
 
 /// 默认的一次 Tab 缩进空格数（可用 `:set tabwidth N` 修改）
-const DEFAULT_TAB_WIDTH: usize = 8;
+pub const DEFAULT_TAB_WIDTH: usize = 8;
 
 /// 文本缓冲 —— 采用「行模型」：每一行是一个 String。
 ///
@@ -203,6 +203,21 @@ impl App {
             show_line_numbers: false,
             tab_width: DEFAULT_TAB_WIDTH,
         }
+    }
+
+    /// 用一个新文档替换当前内容（由 main.rs 在读好文件/目录后调用）。
+    ///
+    /// app.rs **不负责读文件**（那是 file_io.rs 的事），这里只接收结果并重置视图。
+    /// `show_line_numbers` / `tab_width` 属于用户偏好，换文档时保留。
+    pub fn replace_document(&mut self, file_path: String, content: String) {
+        self.buffer = Buffer::from_str(&content);
+        self.file_path = Some(file_path);
+        self.mode = EditorMode::ReadOnly;
+        self.cursor = Cursor::default();
+        self.viewport = Viewport::default();
+        self.command_input.clear();
+        self.status_message.clear();
+        self.dirty = false;
     }
 
     // ---------- 模式切换（供 update.rs 调用） ----------
@@ -696,6 +711,30 @@ mod tests {
     fn text_range_on_empty_line_is_empty_string() {
         let app = App::from_content(None, String::new());
         assert_eq!(app.text_range((0, 0), (0, usize::MAX)).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn replace_document_swaps_content_and_resets_view() {
+        let mut app = App::from_content(Some("old.txt".to_string()), "old".to_string());
+        app.cursor = Cursor { row: 0, col: 3 };
+        app.viewport.top = 2;
+        app.dirty = true;
+        app.show_line_numbers = true;
+        app.tab_width = 2;
+
+        app.replace_document("new.txt".to_string(), "x\ny".to_string());
+
+        assert_eq!(app.file_path.as_deref(), Some("new.txt"));
+        assert_eq!(app.buffer.line_count(), 2);
+        assert_eq!(app.buffer.line(1), Some("y"));
+        assert_eq!((app.cursor.row, app.cursor.col), (0, 0));
+        assert_eq!(app.viewport.top, 0);
+        assert_eq!(app.mode, EditorMode::ReadOnly);
+        assert!(!app.dirty);
+        assert!(app.status_message.is_empty());
+        // 用户偏好类设置应保留
+        assert!(app.show_line_numbers);
+        assert_eq!(app.tab_width, 2);
     }
 
     #[test]
