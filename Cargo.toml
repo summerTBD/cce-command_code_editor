@@ -1,0 +1,10 @@
+[package]
+name = "cce"
+version = "0.1.0"
+edition = "2024"
+description = "CCE - Command Code Editor, a Vim-like terminal editor built with Ratatui"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+unicode-width = "0.2"
