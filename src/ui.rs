@@ -129,7 +129,7 @@ fn draw_mode_hint(frame: &mut Frame, app: &App, area: Rect) {
         EditorMode::ReadOnly => (
             "-- READ-ONLY --",
             Style::default().fg(Color::DarkGray),
-            "q quit | : command | i edit",
+            "q quit | : command | i edit | y copy line",
         ),
         EditorMode::Edit => (
             "-- EDIT --",

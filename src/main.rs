@@ -8,7 +8,9 @@
 
 use std::io;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -31,7 +33,14 @@ fn main() -> io::Result<()> {
     // 2. 初始化终端：进入 raw mode + 备用屏
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // EnableBracketedPaste：告知终端“粘贴时请把内容用标记包起来”，
+    // 这样粘贴会作为**一个** Event::Paste 到达，而不是被拆成一堆按键。
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let mut terminal = Term::new(CrosstermBackend::new(stdout))?;
 
     // 3. 初始状态（若 dirty 有提示需求，可在这里 set_status）
@@ -41,7 +50,12 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     result
 }
 
@@ -63,6 +77,7 @@ fn run(terminal: &mut Term, app: &mut App) -> io::Result<()> {
                             save_file(app)?;
                             return Ok(());
                         }
+                        Action::Copy(text) => copy_to_clipboard(app, &text),
                     }
                 }
             }
@@ -72,8 +87,12 @@ fn run(terminal: &mut Term, app: &mut App) -> io::Result<()> {
             }
             // 尺寸变化无需特殊处理：下一轮 draw 会自动使用新尺寸
             event::Event::Resize(..) => {}
-            // 粘贴 / 忽略事件：MVP 先不管
-            event::Event::Paste(_) | event::Event::Ignored => {}
+            // 粘贴：bracketed paste 已把整段文本聚合成一个事件，交给 update 按模式分发
+            event::Event::Paste(text) => {
+                let (view_h, view_w) = view_size(app);
+                update::handle_paste(app, &text, view_h, view_w);
+            }
+            event::Event::Ignored => {}
         }
     }
 }
@@ -93,6 +112,21 @@ fn view_size(app: &App) -> (usize, usize) {
     let view_h = (rows as usize).saturating_sub(4);
     let view_w = (cols as usize - 2 - gutter_w).max(1);
     (view_h, view_w)
+}
+
+/// 执行复制动作（由 update 返回 `Action::Copy` 后触发）。
+///
+/// 用 `arboard` 直接调操作系统的剪贴板 API（Windows 上是 Win32 clipboard），
+/// **不依赖终端**支持 OSC 52，所以哪个终端都能用。
+fn copy_to_clipboard(app: &mut App, text: &str) {
+    let result = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string()));
+    match result {
+        Ok(()) => app.set_status(format!(
+            "Copied {} chars to clipboard",
+            text.chars().count()
+        )),
+        Err(err) => app.set_status(format!("Copy failed: {err}")),
+    }
 }
 
 /// 执行保存动作（由 update 返回 `Action::Save` 后触发）

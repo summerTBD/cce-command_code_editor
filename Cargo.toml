@@ -5,6 +5,8 @@ edition = "2024"
 description = "CCE - Command Code Editor, a Vim-like terminal editor built with Ratatui"
 
 [dependencies]
+# 只用文本剪贴板；关掉默认的 image-data 特性，避免拖入 image 等大依赖
+arboard = { version = "3", default-features = false }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 unicode-width = "0.2"

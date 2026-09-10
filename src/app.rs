@@ -73,19 +73,6 @@ impl Buffer {
         true
     }
 
-    /// 删除第 x 行；下标非法返回 false（供命令层报告错误）。
-    ///
-    /// 注意：`remove(x)` 之后，原来 x 后面的所有行会整体前移一格。
-    /// 所以如果要连续删多行，**不能**删完再按“原来的 start+1”去删——
-    /// 那样会删到原本的第 2 行。删整段请用下面的 `delete_lines`。
-    pub fn delete_line(&mut self, x: usize) -> bool {
-        if x >= self.lines.len() {
-            return false;
-        }
-        self.lines.remove(x);
-        true
-    }
-
     /// 删除从第 start 行开始的连续 count 行。
     ///
     /// 用 `drain(start..end)` 一次删掉一整段，下标不会因为“删一行而前移”导致错位。
@@ -320,6 +307,68 @@ impl App {
         }
     }
 
+    // ---------- 查询（不改变状态） ----------
+
+    /// 当前光标所在行的文本（只读模式下 `y` 复制用）。
+    ///
+    /// 返回 owned String：调用方要把它交给 `Action::Copy` 带出 app，
+    /// 不能留着对 `self.buffer` 的借用。
+    pub fn current_line_text(&self) -> String {
+        self.buffer.line(self.cursor.row).unwrap_or("").to_string()
+    }
+
+    /// 取出一段文本（行、列均 **0 基**，且**含两端**）。
+    ///
+    /// 供 `:copy` 命令使用。坐标越界或起点在终点之后时返回 `None`，
+    /// 由调用方（update.rs）负责报错。
+    ///
+    /// `col` 会被自动夹到该行末尾，所以想取整行可以传 `usize::MAX`。
+    pub fn text_range(&self, start: (usize, usize), end: (usize, usize)) -> Option<String> {
+        let (sr, sc) = start;
+        let (er, ec) = end;
+        // 起点不得在终点之后（按行优先比较）
+        if sr > er || (sr == er && sc > ec) {
+            return None;
+        }
+        if er >= self.buffer.line_count() {
+            return None;
+        }
+
+        let chars_at =
+            |row: usize| -> Vec<char> { self.buffer.line(row).unwrap_or("").chars().collect() };
+
+        // 同一行：直接取 chars[sc..=ec]
+        if sr == er {
+            let chars = chars_at(sr);
+            if chars.is_empty() {
+                return Some(String::new());
+            }
+            let sc = sc.min(chars.len() - 1);
+            let ec = ec.min(chars.len() - 1);
+            return Some(chars[sc..=ec].iter().collect());
+        }
+
+        // 跨行：首行取 sc 到行尾 + 中间整行 + 末行行首到 ec
+        let mut out = String::new();
+        let first = chars_at(sr);
+        let from = sc.min(first.len());
+        out.extend(first[from..].iter());
+
+        for row in (sr + 1)..er {
+            out.push('\n');
+            out.push_str(self.buffer.line(row).unwrap_or(""));
+        }
+
+        out.push('\n');
+        let last = chars_at(er);
+        if !last.is_empty() {
+            let to = ec.min(last.len() - 1);
+            out.extend(last[..=to].iter());
+        }
+
+        Some(out)
+    }
+
     // ---------- 文本编辑（update.rs 在 Edit 模式下调用） ----------
 
     /// 在光标处插入一个普通字符，光标右移一格
@@ -363,6 +412,36 @@ impl App {
         self.cursor.row += 1;
         self.cursor.col = 0;
         self.dirty = true;
+    }
+
+    /// 粘贴一段文本（来自终端的 bracketed paste，整段一次性到达）。
+    ///
+    /// - 先把 Windows 常见的 `\r\n`（以及孤立的 `\r`）归一化成 `\n`，
+    ///   否则缓冲里会混进 `\r`，显示和保存都会出问题；
+    /// - 再按 `\n` 切段逐行插入，光标最终落在粘贴内容的末尾。
+    ///
+    /// 这里刻意复用 `type_char` / `insert_newline`，让粘贴走和手输完全相同的
+    /// 代码路径（多字节字符、dirty 标记、光标推进都自动一致）。
+    pub fn paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        let mut segments = normalized.split('\n');
+        // 第一段接在光标当前位置（不换行）
+        if let Some(first) = segments.next() {
+            for ch in first.chars() {
+                self.type_char(ch);
+            }
+        }
+        // 其余每段：先断行到新的一行，再写入
+        for segment in segments {
+            self.insert_newline();
+            for ch in segment.chars() {
+                self.type_char(ch);
+            }
+        }
     }
 
     // ---------- 状态栏 ----------
@@ -531,6 +610,92 @@ mod tests {
         assert_eq!(app.buffer.line(0), Some("abcd"));
         assert_eq!(app.cursor.row, 0);
         assert_eq!(app.cursor.col, 2);
+    }
+
+    #[test]
+    fn paste_single_line_inserts_at_cursor() {
+        let mut app = App::from_content(None, "ac".to_string());
+        app.cursor = Cursor { row: 0, col: 1 };
+        app.paste("b");
+        assert_eq!(app.buffer.line(0), Some("abc"));
+        assert_eq!(app.cursor.col, 2);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn paste_multiline_splits_into_rows() {
+        let mut app = App::from_content(None, "ad".to_string());
+        app.cursor = Cursor { row: 0, col: 1 };
+        app.paste("b\nc");
+        assert_eq!(app.buffer.line_count(), 2);
+        assert_eq!(app.buffer.line(0), Some("ab"));
+        assert_eq!(app.buffer.line(1), Some("cd"));
+        assert_eq!((app.cursor.row, app.cursor.col), (1, 1));
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_and_lone_cr() {
+        // Windows 剪贴板常见的 \r\n，以及旧 Mac 风格的孤立 \r
+        let mut app = App::from_content(None, String::new());
+        app.paste("a\r\nb\rc");
+        assert_eq!(app.buffer.line_count(), 3);
+        assert_eq!(app.buffer.line(0), Some("a"));
+        assert_eq!(app.buffer.line(1), Some("b"));
+        assert_eq!(app.buffer.line(2), Some("c"));
+    }
+
+    #[test]
+    fn paste_empty_is_noop() {
+        let mut app = App::from_content(None, "ab".to_string());
+        app.paste("");
+        assert_eq!(app.buffer.line(0), Some("ab"));
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn current_line_text_returns_cursor_row() {
+        let mut app = App::from_content(None, "ab\ncd".to_string());
+        app.cursor = Cursor { row: 1, col: 1 };
+        assert_eq!(app.current_line_text(), "cd");
+    }
+
+    #[test]
+    fn text_range_same_row_is_inclusive() {
+        let app = App::from_content(None, "abcdef".to_string());
+        assert_eq!(app.text_range((0, 0), (0, 2)).as_deref(), Some("abc"));
+        assert_eq!(app.text_range((0, 3), (0, 5)).as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn text_range_usize_max_means_to_end_of_line() {
+        let app = App::from_content(None, "abc".to_string());
+        assert_eq!(
+            app.text_range((0, 0), (0, usize::MAX)).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn text_range_across_rows_keeps_newlines() {
+        let app = App::from_content(None, "abc\ndef\nghi".to_string());
+        assert_eq!(
+            app.text_range((0, 1), (2, 1)).as_deref(),
+            Some("bc\ndef\ngh")
+        );
+    }
+
+    #[test]
+    fn text_range_rejects_reversed_and_out_of_bounds() {
+        let app = App::from_content(None, "ab\ncd".to_string());
+        assert_eq!(app.text_range((1, 0), (0, 0)), None); // 起点在终点之后
+        assert_eq!(app.text_range((0, 2), (0, 1)), None); // 同行但列倒序
+        assert_eq!(app.text_range((0, 0), (5, 0)), None); // 行越界
+    }
+
+    #[test]
+    fn text_range_on_empty_line_is_empty_string() {
+        let app = App::from_content(None, String::new());
+        assert_eq!(app.text_range((0, 0), (0, usize::MAX)).as_deref(), Some(""));
     }
 
     #[test]
