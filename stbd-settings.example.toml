@@ -1,0 +1,93 @@
+# STBD 配置文件（示例 / 模板）
+#
+# ── 怎么用（推荐走捷径）─────────────────────────────
+# 在 STBD 里敲 `:settings`：
+#   · 还没有配置文件 → 它照这份模板在**可执行文件旁边**生成一份，并打开给你改
+#   · 已经有了      → 直接打开给你改
+# 改完 `:w` 保存，再敲 `:config reload` 就生效（不想重载也可以重启 STBD）。
+#
+# 也可以手动放置。查找顺序（先找到的先用）：
+#   1. 环境变量 STBD_CONFIG 指定的路径
+#   2. stbd.exe 旁边的 stbd-settings.toml     ← 首选，配置跟着程序走
+#   3. %APPDATA%\stbd\stbd-settings.toml      ← 兜底（exe 目录写不进去时）
+#      Linux/macOS 为 ~/.config/stbd/stbd-settings.toml
+# 敲 `:config path` 可以看到程序实际读的是哪一个。
+#
+# ── 语法 ───────────────────────────────────────────────
+# · 这是 TOML 格式，就是一行一个 `键 = 值`
+# · `#` 开头的一整行是注释，写给自己看的
+# · 下面每一项都写成了**当前默认值**，所以照抄不改不会改变任何行为
+# · 键名写错会**直接报错**（而不是被悄悄忽略），启动时在状态栏提示原因，
+#   并退回全部默认值 —— 为的是不让你遇到「改了却没生效」这种玄学问题
+# · ⚠️ 分节（[colors] 这种方括号）必须放在文件**最后**：
+#   TOML 的规则是「分节之后的键都属于那个分节」，
+#   在 [colors] 后面写 tab_width = 8 会被当成 colors.tab_width 而报错
+#
+# ── 和 :set 的关系 ─────────────────────────────────────
+# 下面每一项都能在运行中用 `:set` 命令临时改（如 `:set tabwidth 2`），
+# 但那只影响**当前这次运行**，退出就没了。想永久生效就来改这个文件。
+# 反过来，`:set` 也**不会**写回这个文件。
+#
+# 用 `:config` 可以随时查看当前生效的设置。
+
+# 是否显示行号。对应 `:set number` / `:set nonumber`
+show_line_numbers = true
+
+# 一次 Tab 插入的空格数，范围 1-16。对应 `:set tabwidth N`
+# 写代码常改成 4
+tab_width = 8
+
+# 光标与视口上/下边缘至少保持的行距（类似 vim 的 scrolloff），范围 0-100。
+# 对应 `:set scrolloff N`
+scroll_margin = 3
+
+# 光标与视口左/右边缘至少保持的列距（类似 vim 的 sidescrolloff），范围 0-100。
+# 注意单位是**终端显示格数**：一个汉字算 2 格。对应 `:set sidescrolloff N`
+side_scroll_margin = 5
+
+
+# ══════════════════════════════════════════════════════
+# 颜色（这一节必须放在文件最后，原因见上面「语法」）
+# ══════════════════════════════════════════════════════
+#
+# 颜色怎么写：
+#   · 具名色：black red green yellow blue magenta cyan purple gray grey white
+#             darkgray darkgrey lightred lightgreen lightyellow
+#             lightblue lightmagenta lightcyan orange
+#   · 十六进制：#ffcc00，也支持简写 #fc0（等于 #ffcc00）
+#   · 不染色：reset（也可以写 default / none）→ 用终端默认色
+#
+# 大小写不敏感，两边的空格会被忽略。
+# 只写其中几项也行，没写的用默认值（下面的值就是默认值）。
+# 改完要**重启 STBD** 才生效。
+
+[colors]
+# 正文文字
+text = "green"
+
+# 行号
+line_number = "yellow"
+
+# 当前行的背景色（想关掉高亮就写 "reset"）
+# 0x303030 是原来写死的深灰
+current_line_bg = "#303030"
+
+# 文本区的边框和标题
+border = "reset"
+
+# `:` 命令输入
+command = "cyan"
+
+# 只读模式的模式标签（-- READ-ONLY --）
+mode_readonly = "darkgray"
+
+# 编辑模式的模式标签（-- EDIT --）
+# 编辑模式会改文件，所以默认给个显眼的黄色提醒自己
+mode_edit = "yellow"
+
+# 快捷键提示文字
+hint = "darkgray"
+
+# 底部状态信息（如 Saved xxx）
+status = "green"
+

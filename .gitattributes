@@ -1,0 +1,7 @@
+# 行尾统一：仓库里存 LF，检出到工作区也是 LF。
+#
+# 为什么显式写死：Windows 上 `core.autocrlf=true`（本机就是）会让 Git 在
+# 检出时把 LF 换成 CRLF、提交时再换回来 —— 文件在磁盘上被反复改写、
+# 每次 diff 都刷一排警告，而且换个 `autocrlf` 设置就会炸出「整份文件都改了」
+# 的假 diff。显式声明之后行为跟平台和全局设置都无关。
+* text=auto eol=lf

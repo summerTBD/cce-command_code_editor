@@ -1,12 +1,21 @@
 [package]
-name = "cce"
+name = "stbd"
 version = "0.1.0"
 edition = "2024"
-description = "CCE - Command Code Editor, a Vim-like terminal editor built with Ratatui"
+description = "STBD - a Vim-like terminal code editor built with Ratatui"
 
 [dependencies]
 # 只用文本剪贴板；关掉默认的 image-data 特性，避免拖入 image 等大依赖
 arboard = { version = "3", default-features = false }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
+# 关掉默认的 unicode_lines / cr_lines：只把 '\n' 当作换行，与 Buffer::from_str 的
+# split('\n') 语义完全一致（迁移期间要保持行为不变）。simd 保留，用来加速字节统计。
+# 将来想支持 CRLF 文件，再单独开 unicode_lines 并补测试。
+ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
+# 只用来把配置文件反序列化成 Config 结构体
+serde = { version = "1.0.229", features = ["derive"] }
+# 配置文件的解析：只开 parse + serde + std。
+# 关掉 display（我们不写回配置文件）与 preserve_order 等，少拖几个依赖进来。
+toml = { version = "1.1.6", default-features = false, features = ["parse", "serde", "std"] }
 unicode-width = "0.2"

@@ -1,0 +1,20 @@
+# 编辑器约定（VS Code / 大多数编辑器原生支持 .editorconfig）。
+#
+# 这里跟 .gitattributes 是**配套**的：.gitattributes 管「git 怎么存」，
+# 这里管「编辑器怎么写」。两边都写死 LF，才不会出现
+# 「编辑器写 CRLF → git 转成 LF → 每次 add 都警告」这种来回折腾。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+
+[*.{md,toml,yml,yaml,json}]
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格是「硬换行」，不能被当成多余空白清掉
+trim_trailing_whitespace = false

@@ -1,6 +1,10 @@
 pub mod app;
+pub mod buffer;
+pub mod commands;
+pub mod config;
+pub mod documents;
 pub mod event;
 pub mod file_io;
 pub mod ui;
+pub mod undo;
 pub mod update;
-

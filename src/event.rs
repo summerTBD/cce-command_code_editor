@@ -33,10 +33,10 @@ pub enum Event {
 /// 阻塞等待并返回下一个“关心的事件”。
 ///
 /// 会一直读到出现有意义的事件为止（自动跳过 `Event::Ignored`）。
-pub fn read() -> io::Result<Event> {
+pub fn read_next_event() -> io::Result<Event> {
     loop {
         let ev = event::read()?;
-        match translate(ev) {
+        match translate_crossterm_event(ev) {
             Event::Ignored => continue,
             ours => return Ok(ours),
         }
@@ -49,7 +49,7 @@ pub fn poll(timeout: Duration) -> io::Result<bool> {
 }
 
 /// 把 crossterm 的原始事件翻译成编辑器自己的 `Event`
-fn translate(ev: CrosstermEvent) -> Event {
+fn translate_crossterm_event(ev: CrosstermEvent) -> Event {
     match ev {
         CrosstermEvent::Key(key) => {
             // 在 Windows 上，一次按键会同时产生 Press 和 Release 两个事件，
