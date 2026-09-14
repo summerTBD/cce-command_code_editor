@@ -63,6 +63,13 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
             app.buffer.get_line_count(),
             OutFile::FileList.name()
         ),
+        // `:lsp` 那份不是「关于某个文件」的，所以标题不带文件名 ——
+        // 它讲的是**整个程序**的语言服务器配置，跟你在看哪个文件无关。
+        DocumentKind::LspStatus => format!(
+            " STBD · language servers ({})  →  {} ",
+            app.buffer.get_line_count(),
+            OutFile::LspStatus.name()
+        ),
         _ => format!(" STBD · {file_name}{dirty_mark} "),
     };
 
@@ -293,16 +300,18 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    /// 默认配色：正文绿、行号黄（用户点名要的效果）
+    /// 默认配色：正文绿、行号暗灰（用户点名要的效果）
     #[test]
     fn default_colors_reach_the_screen() {
         let app = App::from_content(None, "hello".to_string());
         let buffer = render_frame(&app, 20, 6);
 
         // 第 1 个内容行在第 1 行（第 0 行是上边框）；
-        // 左边框占第 0 列，行号 "1 " 占第 1-2 列，正文从第 3 列开始
+        // 左边框占第 0 列，行号 "1 " 占第 1-2 列，正文从第 3 列开始。
+        //
+        // ⚠️ 行号是**暗灰**而不是黄的：它得给警告色让位（见 `DEFAULT_LINE_NUMBER_COLOR`）。
         assert_eq!(buffer[(1, 1)].symbol(), "1");
-        assert_eq!(buffer[(1, 1)].fg, Color::Yellow, "行号应该是黄色");
+        assert_eq!(buffer[(1, 1)].fg, Color::DarkGray, "行号应该是暗灰");
 
         assert_eq!(buffer[(3, 1)].symbol(), "h");
         assert_eq!(buffer[(3, 1)].fg, Color::Green, "正文应该是绿色");

@@ -65,12 +65,61 @@ pub struct Failure {
     pub already_reported: bool,
 }
 
-/// 一个活着的会话，以及它是为哪个根起的。
+/// 池子里某个会话这一轮说的话，以及**是哪个服务器说的**。
+///
+/// 为什么要带上是谁说的：这些话最终会变成状态栏上的一句话。以前那里写死了
+/// `"LSP: rust-analyzer is ready"` —— 于是配置里起了 `clangd` 的时候，
+/// 屏幕上照样写着 rust-analyzer。那句话是**唯一**能看出「服务器到底起没起、
+/// 起的是哪个」的地方，说错名字比不说还糟：用户会拿它去确认一个根本没发生的事。
+#[derive(Debug)]
+pub struct Spoken {
+    /// 说这话的命令（`rust-analyzer` / `clangd` / 配置里写的任何东西）。
+    pub command: String,
+    /// 这个会话管的是哪个根（项目）。
+    pub root_uri: String,
+    pub outcome: Outcome,
+}
+
+/// 一个活着的会话，以及它管的是「哪个命令的哪个根」。
 struct Entry {
-    /// `initialize` 里发出去的那个 `rootUri`。**用原样的字符串当钥匙** ——
-    /// 它由 `uri::path_to_uri` 产出，同一个路径必然产出同一个串。
+    /// 起这个会话用的命令。**存着它**而不是只存拼好的钥匙 ——
+    /// 因为状态栏要说得出是哪个服务器（见 [`Spoken`]），
+    /// 而从一个拼好的字符串里往回拆是多余的活。
+    command: String,
+    /// 这个会话的项目根。
     root_uri: String,
     session: Session,
+}
+
+impl Entry {
+    /// 这个会话的身份：同一个命令 + 同一个根 = 同一个会话。
+    ///
+    /// **算出来，不存下来** —— 存的话就有两个地方能改，而它们一旦不一致，
+    /// 症状是「打开另一个项目时又起了一个服务器」，看不出来为什么。
+    fn key(&self) -> String {
+        key_of(&self.command, &self.root_uri)
+    }
+}
+
+/// 「哪个命令 + 哪个根」拼成一把钥匙。
+///
+/// ## ⚠️ 为什么不能只用「根」当钥匙
+///
+/// 因为同一个目录下可以有**多个**服务器各管一摊：Rust 一份、C/C++ 一份。
+/// 只用根当钥匙的话，你打开 `.c` 时池子会说「这个根已经有会话了」，
+/// 然后把 **rust-analyzer** 交出去 —— 而 rust-analyzer 会拿 Rust 的语法去解析
+/// 你的 C 代码，报出一堆**假的**错误（实测过：拿 Rust 解析 Python 会报
+/// 4 条 `expected an item`）。
+///
+/// ## 为什么要带上命令而不是语言名
+///
+/// 因为「两个语言用同一个服务器」是常见情况（我们内置的 `c` 和 `cpp`
+/// 都是 `clangd`）—— 带上命令，它们自然会共用同一个进程，不用特意去合。
+///
+/// `@` 只是个分隔符。**不怕撞车**：命令和根不可能同时含有它拼出歧义 ——
+/// 就算真撞了，现象也只是「两个服务器共用一个会话」，不会崩也不会错数据。
+fn key_of(command: &str, root_uri: &str) -> String {
+    format!("{command}@{root_uri}")
 }
 
 /// 会话池。
@@ -79,7 +128,7 @@ pub struct Pool {
     limit: usize,
     /// 按「最近用过」排序：**末尾是最新的**，淘汰从头上下手。
     entries: Vec<Entry>,
-    /// 上次报过失败的那个根（见 [`Failure::already_reported`]）。
+    /// 上次报过失败的那把钥匙（见 [`Failure::already_reported`]）。
     last_failure: Option<String>,
 }
 
@@ -99,16 +148,19 @@ impl Pool {
         self.trim();
     }
 
-    /// 拿到这个根的会话；没有就开始一个新的。
+    /// 拿到「这个命令 + 这个根」的会话；没有就开始一个新的。
     ///
     /// `start` 只在**真的需要**新会话时才会被调用 —— 所以「怎么起一个服务器」
     /// 这件事留在调用方（它知道用哪个命令、哪个工作目录），池子只管
     /// 「留几个、淘汰谁」。
     pub fn acquire(
         &mut self,
+        command: &str,
         root_uri: &str,
         start: impl FnOnce() -> io::Result<Session>,
     ) -> Result<&mut Session, Failure> {
+        let key = key_of(command, root_uri);
+
         // ⚠️ 这个守卫**不只是**防呆。它担着两件事，实测（拿掉它跑
         //    `a_limit_of_zero_starts_nothing_at_all`）：
         //
@@ -119,14 +171,14 @@ impl Pool {
         //       `attempt to subtract with overflow`，与真正的原因（上限 0）
         //       隔着十万八千里。
         if self.limit == 0 {
-            return Err(self.failure(root_uri, "language servers are off".to_string()));
+            return Err(self.failure(&key, "language servers are off".to_string()));
         }
 
         // ⚠️ 先把下标算出来，再 match。写成 `match self.entries.iter().position(..)`
         //    的话，那个临时迭代器的借用会活到**整个 match 结束**（Rust 里
         //    match 的临时值就是这么活着的），于是每个分支里对 `self.entries`
         //    的修改都会被借用检查拦住。
-        let existing = self.entries.iter().position(|e| e.root_uri == root_uri);
+        let existing = self.entries.iter().position(|e| e.key() == key);
 
         let index = match existing {
             Some(index) => {
@@ -139,9 +191,10 @@ impl Pool {
             None => {
                 let session = match start() {
                     Ok(session) => session,
-                    Err(err) => return Err(self.failure(root_uri, err.to_string())),
+                    Err(err) => return Err(self.failure(&key, err.to_string())),
                 };
                 self.entries.push(Entry {
+                    command: command.to_string(),
                     root_uri: root_uri.to_string(),
                     session,
                 });
@@ -157,12 +210,13 @@ impl Pool {
 
     /// 收所有人的话。
     ///
-    /// 每一项都带着**是哪个根说的** —— 因为诊断要按根才能判断
-    /// 「它说的是不是现在屏幕上这个文件」。
+    /// 每一项都带着**是谁说的**（哪个命令 + 哪个根）—— 状态栏要靠它说出
+    /// 正确的服务器名（见 [`Spoken`]），而诊断要靠「哪个根」之外的东西
+    /// 判断「它说的是不是现在屏幕上这个文件」。
     ///
     /// 报过 [`Outcome::Broken`] 的会话会在这里被丢掉（`drop` 顺带收尸）：
     /// 那条线已经没了，之后再也不会产出任何东西，留着只会每轮白白问一次。
-    pub fn poll_all(&mut self) -> Vec<(String, Outcome)> {
+    pub fn poll_all(&mut self) -> Vec<Spoken> {
         let mut collected = Vec::new();
         let mut survivors = Vec::with_capacity(self.entries.len());
 
@@ -173,7 +227,11 @@ impl Pool {
                 if matches!(outcome, Outcome::Broken(_)) {
                     broken = true;
                 }
-                collected.push((entry.root_uri.clone(), outcome));
+                collected.push(Spoken {
+                    command: entry.command.clone(),
+                    root_uri: entry.root_uri.clone(),
+                    outcome,
+                });
             }
             if !broken {
                 survivors.push(entry);
@@ -193,11 +251,26 @@ impl Pool {
         self.entries.is_empty()
     }
 
+    /// 现在活着的会话：`(命令, 根 uri)`，按「最久没用过的」到「刚用过的」。
+    ///
+    /// `:lsp` 那一屏靠它说出「现在跑着哪几个」。**它和 [`Pool::keys`] 是
+    /// 同一份数据的两种说法**，所以 `keys` 由它拼出来 —— 两个各自遍历一遍
+    /// 的话，哪天换了排序规则就会出现「表里说在跑、钥匙里没有」这种对不上。
+    pub fn running(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.command.clone(), entry.root_uri.clone()))
+            .collect()
+    }
+
     /// 活着的会话，按「最久没用过的」到「刚用过的」排列。
     ///
     /// 给测试用的 —— 「淘汰谁」这件事的正确性全靠这个顺序，而它是看不见的。
-    pub fn roots(&self) -> Vec<&str> {
-        self.entries.iter().map(|e| e.root_uri.as_str()).collect()
+    pub fn keys(&self) -> Vec<String> {
+        self.running()
+            .into_iter()
+            .map(|(command, root)| key_of(&command, &root))
+            .collect()
     }
 
     /// 把那几个多出来的收掉。
@@ -212,10 +285,10 @@ impl Pool {
         }
     }
 
-    /// 拼一个失败出去，并记下「这个根刚报过」。
-    fn failure(&mut self, root_uri: &str, reason: String) -> Failure {
-        let already_reported = self.last_failure.as_deref() == Some(root_uri);
-        self.last_failure = Some(root_uri.to_string());
+    /// 拼一个失败出去，并记下「这把钥匙刚报过」。
+    fn failure(&mut self, key: &str, reason: String) -> Failure {
+        let already_reported = self.last_failure.as_deref() == Some(key);
+        self.last_failure = Some(key.to_string());
         Failure {
             reason,
             already_reported,

@@ -520,6 +520,92 @@ fn stays_clean_for(session: &mut Session, window: Duration) -> Option<PublishDia
     None
 }
 
+// ---------- 真服务器：clangd（C / C++） ----------
+
+/// **拿真的 clangd 走一遍完整的路。**
+///
+/// 标 `#[ignore]`：依赖本机装了 clangd（随 LLVM 发行版就有）。
+///
+/// ```text
+/// cargo test --test lsp_session -- --ignored --nocapture the_whole_loop_with_the_real_clangd
+/// ```
+///
+/// ## 它回答三个问题
+///
+/// 1. **没有 `compile_commands.json` 时它到底说不说话？**
+///    配置表里给 clangd 的 `root_marker` 写的是「不要求项目根」，理由就是
+///    「它自己会往上找」。要是它其实什么都不说，那条配置就是错的 ——
+///    而错误的样子是「C 文件永远没诊断」，两头都看不出毛病。
+///    ✅ 实测（2026-09-15，单文件无 include）：**说**，而且诊断是真话。
+/// 2. **`languageId: "c"` 它认不认？** ✅ 认（回来的诊断是 C 的）。
+/// 3. **全量 `didChange`（不带 `range`）它认不认？** —— 这条之前只在
+///    rust-analyzer 上验过，而「不带 range 就是整份替换」是我们照着规范
+///    写死的前提。同一条前提在两个服务器上都得成立，才算真的成立。
+#[test]
+#[ignore = "需要 clangd，手动跑"]
+fn the_whole_loop_with_the_real_clangd() {
+    let dir = std::env::temp_dir().join("stbd-clangd-loop");
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    let file = dir.join("probe.c");
+
+    let root_uri = stbd::lsp::uri::path_to_uri(&dir).expect("目录该能转成 uri");
+    let uri = stbd::lsp::uri::path_to_uri(&file).expect("文件该能转成 uri");
+
+    let clean = "int main(void) { return 0; }\n";
+    // 少一个分号 —— clangd 该报「expected ';'」
+    let broken = "int main(void) { return 0 }\n";
+    std::fs::write(&file, broken).expect("写临时文件");
+
+    let mut session = Session::start("clangd", &[], Some(dir.as_path()), Some(&root_uri))
+        .expect("起不来 clangd（本机装了吗？）");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut ready = false;
+    while Instant::now() < deadline && !ready {
+        ready = session.poll().contains(&Outcome::Ready);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready, "握手没走完；日志：{:#?}", session.log_tail());
+
+    // ---- ① 弄坏 → 该收到一条说「少了分号」的错误 ----
+    session.show(&uri, "c", broken).expect("show 不该失败");
+    let push = wait_for_push(&mut session, "弄坏之后", |push| {
+        !push.diagnostics.is_empty()
+    });
+    let message = push.diagnostics[0].message.clone();
+    eprintln!("① 弄坏之后：{}", push.diagnostics[0].describe());
+    assert!(
+        message.contains(';'),
+        "诊断里提都没提分号 —— 这看着不像 C 的错误，倒像**拿别的语言的解析器**在解析它：{message:?}"
+    );
+
+    // ---- ② 改好 → 该来一份空的，而且**一直空着** ----
+    //
+    // 「一直空着」这一步是重点，理由跟 rust-analyzer 那条一样：
+    // 有些服务器在**收到改动当下**会先推一份空的（把旧诊断擦掉），
+    // 只等「一份空的」的话，那次 `didChange` 没生效也会假绿。
+    session.poll();
+    session.show(&uri, "c", clean).expect("show 不该失败");
+
+    let cleared = wait_for_push(&mut session, "改好之后", |push| {
+        push.diagnostics.is_empty()
+    });
+    eprintln!("② 改好之后收到一份空推送（{}）", cleared.uri);
+
+    if let Some(again) = stays_clean_for(&mut session, Duration::from_secs(5)) {
+        panic!(
+            "擦掉之后错误又回来了 —— 那次 didChange 根本没生效（{} 条：{:?}）",
+            again.diagnostics.len(),
+            again
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.describe())
+                .collect::<Vec<_>>()
+        );
+    }
+    eprintln!("③ 之后 5 秒一直是干净的 —— 全量 didChange clangd 也认");
+}
+
 // ---------- 探针：换个项目的文件它认不认 ----------
 
 /// 【探针】**根在 A 的服务器，看不看得见 B 项目的文件？**

@@ -20,8 +20,15 @@
 //! 2. **内容只在那条命令跑的时候改。** `:ls` 写完之后就不管了：诊断变了、
 //!    文档列表变了，文件里那行字也不会自己变。所以「屏幕上这份东西是什么时候的」
 //!    永远是确定的 —— 想知道现在什么样，再敲一次那条命令。
-//! 3. **进入和退出各清一次。** 上一次的程序可能是崩掉的（没走到退出那一步），
-//!    所以只清退出是不够的；两边都清，才真的保证「你看到的都是这一次的」。
+//! 3. **只在进入时清一次。** 上一次那张列表看起来跟这一次的一模一样，
+//!    你会拿着上次的当这次的用；进清一次，你就永远是拿这一次的。
+//!
+//!    ⚠️ 这里原来还有「**退出时也清一次**」，2026-09-15 去掉了。它和上面第 2 条
+//!    其实是**矛盾**的（退出不是「那条命令跑的时候」），而代价是实测出来的：
+//!    `:errors` 之后一 `:q`，`error_log.txt` 就空了 —— 于是「把清单写成文件」
+//!    只剩下「编辑器开着时另一个窗口去读」这一种用法，退出之后就拿不到了。
+//!    而它**换不来任何东西**：进入那次清已经保证了「打开时看到的都是干净的」，
+//!    不管上次是正常退出还是崩掉。
 //!
 //! ## ⚠️ 清理只**清空我们的文件**，不碰别人的
 //!
@@ -84,11 +91,13 @@ pub enum OutFile {
     FileList,
     /// `error_log.txt`：`:errors` 的产出
     ErrorLog,
+    /// `lsp_status.txt`：`:lsp` 的产出（配了哪些语言服务器、命令在不在）
+    LspStatus,
 }
 
 impl OutFile {
     /// 全部已知的产出文件（清理按这个走）。
-    pub const ALL: &'static [OutFile] = &[OutFile::FileList, OutFile::ErrorLog];
+    pub const ALL: &'static [OutFile] = &[OutFile::FileList, OutFile::ErrorLog, OutFile::LspStatus];
 
     /// 它在文件夹里叫什么名字。
     ///
@@ -105,6 +114,7 @@ impl OutFile {
         match self {
             Self::FileList => "file_list.txt",
             Self::ErrorLog => "error_log.txt",
+            Self::LspStatus => "lsp_status.txt",
         }
     }
 }
@@ -229,8 +239,8 @@ mod tests {
             assert!(file.name().ends_with(".txt"), "{}", file.name());
         }
         // ⚠️ 清理按 ALL 走 —— 加了新变体却忘了加进 ALL 的话，那个文件永远不会被清，
-        //    「进入和退出各清一次」这条规矩就悄悄破了一个角
-        assert_eq!(OutFile::ALL.len(), 2);
+        //    「进入时清一次」这条规矩就悄悄破了一个角
+        assert_eq!(OutFile::ALL.len(), 3);
         assert!(OutFile::ALL.contains(&OutFile::FileList));
         assert!(OutFile::ALL.contains(&OutFile::ErrorLog));
     }

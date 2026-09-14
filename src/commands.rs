@@ -106,6 +106,15 @@ pub enum Action {
     /// 只带「往哪个文件写」—— **不带正文**。正文就是 `App` 里那个缓冲区，
     /// main 抄它就行。带上正文等于把同一份东西存两处，两边迟早对不上。
     WriteOutbox(OutFile),
+    /// 铺一份「语言服务器现在什么状况」的清单（`:lsp`）。
+    ///
+    /// ⚠️ 它和上面那几种清单**不一样**：`:ls` / `:errors` 的内容全在 `App` 里
+    /// （文档列表、诊断），所以命令层自己就能拼出正文；这一份要说出
+    /// 「现在跑着哪几个」，而那只有**池子**知道。
+    ///
+    /// 池子是活着的东西（进程、线程、通道），按这个文件顶上那条纪律
+    /// 不该让命令层碰 —— 所以这里只返回一个「要铺」，正文交给主循环拼。
+    ShowLspStatus,
 }
 
 // ===== 命令表 =====
@@ -119,6 +128,7 @@ const LS_USAGE: &str = "Usage: ls";
 const FORGET_USAGE: &str = "Usage: forget <n>  (n comes from :ls)";
 const CHECK_USAGE: &str = "Usage: check";
 const ERRORS_USAGE: &str = "Usage: errors";
+const LSP_USAGE: &str = "Usage: lsp";
 const OPEN_USAGE: &str = "Usage: open <path> [--force]";
 const WRITE_USAGE: &str = "Usage: write [<path>]";
 const WQ_USAGE: &str = "Usage: wq";
@@ -242,6 +252,13 @@ const COMMANDS: &[Spec] = &[
         //    「这个命令会弄丢什么吗」才是 `--force` 存在的理由，而它不丢东西。
         aliases: &[],
         usage: ERRORS_USAGE,
+        force: false,
+    },
+    Spec {
+        name: "lsp",
+        // 同样不需要 `--force`：和 `:errors` 一样是把当前文档原样存下来再铺清单。
+        aliases: &[],
+        usage: LSP_USAGE,
         force: false,
     },
     // ---- 编辑 ----
@@ -761,6 +778,11 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             let shown = open_error_list(app);
             Ok(shown.then_some(Action::WriteOutbox(OutFile::ErrorLog)))
         }
+        // ⚠️ 这里**不**拼正文，也不决定要不要铺 —— 正文需要池子（见
+        //    [`Action::ShowLspStatus`]），而池子在主循环手上。
+        //    正因如此这条命令**永远不会失败**（没有「没有东西可列」那种情况：
+        //    内置那三条永远在表里）。
+        ("lsp", []) => Ok(Some(Action::ShowLspStatus)),
 
         // 名字认得，但这组位置参数不是它接受的样子（少写了 / 多写了 / 子命令拼错了）
         _ => Err(spec.usage.to_string()),
@@ -1480,6 +1502,7 @@ mod tests {
             "set sidescrolloff 1",
             "set lspmaxservers 1",
             "errors",
+            "lsp",
         ];
 
         for spec in COMMANDS {
@@ -1911,6 +1934,43 @@ mod tests {
         // 按行号排好、一条一行
         assert_eq!(app.buffer.get_line(0).as_deref(), Some("1: warning: meh"));
         assert_eq!(app.buffer.get_line(1).as_deref(), Some("3: error: boom"));
+    }
+
+    /// `:lsp` 只产出一个动作，**不在命令层拼正文**。
+    ///
+    /// ⚠️ 这不是「实现细节」：正文里有一列是「现在跑着哪几个」，而那只有池子
+    /// 知道 —— 池子是活的（进程、线程、通道），按这个文件顶上的纪律不该让
+    /// 命令层碰。所以命令层只举手，正文和铺屏都归主循环。
+    ///
+    /// 这里同时也钉住了「它永远不会失败」：内置那三条永远在表里，
+    /// 所以不存在 `:errors` 那种「没东西可列就别铺」的情况。
+    #[test]
+    fn lsp_asks_the_main_loop_to_show_its_list() {
+        let mut app = app_with("hello");
+
+        assert_eq!(run(&mut app, "lsp"), Some(Action::ShowLspStatus));
+
+        // 命令层**没有**动屏幕 —— 铺屏是主循环的事
+        assert_eq!(app.kind, crate::app::DocumentKind::File);
+    }
+
+    /// 它和 `:errors` / `:ls` 一样**不需要 `--force`** —— 而且给了还会被拒。
+    ///
+    /// 这不是形式主义：`force` 的唯一理由是「这个命令会弄丢什么吗」。
+    /// `:lsp` 铺清单的时候当前那份文档会被原样存下来，`q` 时一个字不差地
+    /// 放回去（和 `:errors` 同一条路），所以它不丢东西 —— 那就**不该**
+    /// 让用户养成「凡是要顶掉屏幕就得加 --force」这种习惯。
+    #[test]
+    fn lsp_rejects_force_because_it_destroys_nothing() {
+        let mut app = app_with("hello");
+        assert!(run(&mut app, "lsp --force").is_none());
+        assert!(
+            app.status_message.contains("Unknown option: --force"),
+            "{}",
+            app.status_message
+        );
+        // 而且什么都没发生：屏幕还是原来那份文档
+        assert_eq!(app.kind, crate::app::DocumentKind::File);
     }
 
     /// `:ls` 铺一屏之后**也要落成文件**。

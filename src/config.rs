@@ -69,6 +69,7 @@
 //! `Config` 只是**数据 + 加载逻辑**，它不知道 `App` 的存在。
 //! 依赖方向是 `app.rs → config.rs`（单向），所以默认值常量定义在这里而不是 app.rs。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ratatui::style::Color;
@@ -88,27 +89,48 @@ pub const DEFAULT_SIDE_SCROLL_MARGIN: usize = 5;
 
 /// 默认最多同时保留几个语言服务器。
 ///
-/// ## 为什么是 2
+/// ## 为什么是 3
 ///
 /// 实测（2026-09-14，本机，这个项目）：**一个加载完的 `rust-analyzer`
 /// 工作集约 1.2 GB**（另外 VS Code 自己那个同项目的约 0.7 GB）。
-/// 拿这个数去乘：
+/// 拿这个数去乘：3 最坏也就 ~3.6 GB，而且**只在真的打开了三个项目时**才会到。
 ///
-/// - `2` → 最坏 ~2.4 GB，而且**只在真的打开了两个项目时**才会到
-/// - `4` → 最坏 ~5 GB，对一台还开着 VS Code 的机器太多了
+/// ⚠️ **它数的是「进程」，不是「项目」。** 池子的钥匙是
+/// 「命令 + 项目根」（见 `lsp::pool::key_of`），所以一个 Rust 和 C 混着的
+/// 项目**自己就要两个进程**（`rust-analyzer` + `clangd`；clangd 小得多）。
 ///
-/// 而 `2` 恰好盖住最常见的多项目形态：**库 + 用它的程序**。
-/// 在这两个之间来回跳时不用等重新加载（冷加载要几秒）。
+/// 这就是从 2 改成 3 的原因：写 2 的时候，「一个混着 C 的 Rust 项目」
+/// 已经把名额吃满了，再跳一次项目就开始来回颠 —— 而颠的代价是每次冷加载
+/// 好几秒（rust-analyzer 尤其明显）。写 3 恰好盖住这个形态，
+/// 也还盖得住最经典的那个：**库 + 用它的程序**。
 ///
 /// ⚠️ 会话是**用到了才起**的，不是预先养几个 —— 所以你只在一个项目里干活时，
-/// `1` 和 `2` 完全一样（都只有一个进程）。这个数字管的是「最多允许几个」。
-pub const DEFAULT_LSP_MAX_SERVERS: usize = 2;
+/// `1` 和 `3` 完全一样（都只有一个进程）。这个数字管的是「最多允许几个」。
+pub const DEFAULT_LSP_MAX_SERVERS: usize = 3;
 
 /// 默认的正文颜色
 pub const DEFAULT_TEXT_COLOR: Color = Color::Green;
 
-/// 默认的行号颜色
-pub const DEFAULT_LINE_NUMBER_COLOR: Color = Color::Yellow;
+/// 默认的行号颜色。
+///
+/// ⚠️ **暗灰是故意的，不是随手选的。**
+///
+/// 行号是**背景设施** —— 它的本职是让你能报出「第几行」，而不是吸引眼球。
+/// 而颜色在这个界面上是个**稀缺资源**：行号栏只有一个小格子，
+/// 既要表示「这是行号」、又要表示「这一行有毛病」。
+///
+/// 以前行号是黄色的，结果**跟警告色抢**（警告的惯例色就是黄）—— 两者一个 SGR 33
+/// 偏橄榄、一个 SGR 93 偏亮，理论上分得开，实际上看着像同一件事。
+/// 把行号退成暗灰之后：
+///
+/// ```text
+/// 暗灰 → 这一行没毛病
+/// 黄色 → 警告
+/// 红色 → 错误
+/// ```
+///
+/// 三种状态一眼分得开，而且代码本身（默认绿色）更突出。
+pub const DEFAULT_LINE_NUMBER_COLOR: Color = Color::DarkGray;
 
 /// 默认的「错误」颜色（行号染成它、`:errors` 列表里那一行也是它）。
 ///
@@ -119,10 +141,8 @@ pub const DEFAULT_ERROR_COLOR: Color = Color::LightRed;
 
 /// 默认的「警告」颜色。
 ///
-/// ⚠️ 它和**默认的行号色（黄色）挨得近**。这不是疏忽，是没办法：行号栏上
-/// 只有「颜色」这一个标记可用，而警告的惯例色就是黄的。
-/// 两者在大多数终端里还是能分开的（SGR 33 偏橄榄，SGR 93 明显更亮），
-/// 真觉得看不清就把 `[colors] line_number` 改成 `darkgray` —— 那也是很多人的首选。
+/// 它现在能和行号色共存了 —— 因为行号退成了暗灰（见
+/// [`DEFAULT_LINE_NUMBER_COLOR`]）。在那之前这两个是抢着用的。
 pub const DEFAULT_WARNING_COLOR: Color = Color::LightYellow;
 
 /// 默认的「当前行」背景色。0x303030 就是原来写死的 `Color::Indexed(236)`
@@ -189,6 +209,24 @@ pub struct Config {
     /// 而且它们走的是**同一份代码**（一个列表 + 一个上限），不是两条路。
     #[serde(default = "default_lsp_max_servers")]
     pub lsp_max_servers: usize,
+    /// 各个语言服务器：`[lsp.<语言>]` 一节一个。
+    ///
+    /// ⚠️ 配置文件里写的那几节是**并进**内置默认，不是替换它 ——
+    /// 见 [`Config::prepare_lsp`]。整个替换的话，一份没写 `[lsp]` 的配置
+    /// （包括老版本生成的模板）会让「Rust 诊断」凭空消失，
+    /// 而原因藏在「配置文件里没写」这种根本想不到的地方。
+    ///
+    /// ⚠️ 这里的 `default` 只说「这个字段可以不在配置文件里」。内置那三条
+    /// **不是**从这儿来的 —— 它们由 [`Config::prepare_lsp`] 并进来，而
+    /// `prepare_lsp` 是 [`Config::parse`] 的必经之路，所以那是**唯一**入口。
+    ///
+    /// 这儿原来写的是 `#[serde(default = "default_lsp")]`，看着像
+    /// 「内置值从这儿来」。红检时把 `default_lsp` 摘掉、测试**照样绿**，
+    /// 才发现它是句废话 —— 而且比废话更坏：它让「内置表打哪儿来」有了
+    /// **两个**似是而非的答案，下一个读到这里的人只会挑一个信。
+    /// （`default_lsp` 本身还有用：手写的 [`Config::default`] 要用它。）
+    #[serde(default)]
+    pub lsp: HashMap<String, LspServer>,
     /// 界面各部分用什么颜色
     #[serde(default)]
     pub colors: Colors,
@@ -424,9 +462,134 @@ impl Default for Config {
             scroll_margin: DEFAULT_SCROLL_MARGIN,
             side_scroll_margin: DEFAULT_SIDE_SCROLL_MARGIN,
             lsp_max_servers: DEFAULT_LSP_MAX_SERVERS,
+            lsp: default_lsp(),
             colors: Colors::default(),
         }
     }
+}
+
+/// 一个语言服务器 —— 配置里 `[lsp.<名字>]` 那一节。
+///
+/// ## 我们**不内置任何语言知识**
+///
+/// 「`.py` 是 Python」这种判断**不在代码里**，而在配置里（`extensions`）。
+/// 理由跟「我们一行分析代码的逻辑都没有」是同一个：哪种后缀算哪种语言，
+/// 是**你的工具链**说了算的事，不是编辑器该拍板的。
+/// 而且内置了的话，你想给一个我们没听过的语言（Zig、Nim）配服务器就卡住了。
+///
+/// ## 节名就是语言名
+///
+/// `[lsp.rust]` 的节名 `rust` 会当作 `didOpen` 里报的 `languageId` ——
+/// 除非你写 `language_id` 覆盖它。最常见的情况（节名就是语言名）不用写两遍。
+///
+/// ⚠️ `languageId` 不是装饰：`clangd` 靠它决定把 `.h` 当 C 还是 C++ 解析。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+// 表里键名写错（`comand`）会直接报错并指出第几行，跟别的配置一个待遇
+#[serde(deny_unknown_fields)]
+pub struct LspServer {
+    /// 配置里那一节的节名（`language_id` 没写时用它兜底）。
+    ///
+    /// `skip` 是因为它来自表的**键**，不在那一节**里面** ——
+    /// serde 反序列化一个 `HashMap<String, LspServer>` 时只看得到值。
+    /// 填它的活由 [`Config::prepare_lsp`] 干。
+    #[serde(skip)]
+    pub name: String,
+    /// 起什么命令。**可以是绝对路径**（那个程序不在 PATH 上时用）。
+    ///
+    /// ⚠️ 留空 = 这条不要了。用来关掉一条内置的（比如你不想要 clangd）。
+    pub command: String,
+    /// 命令行参数（一个词一个，不用自己加引号）
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 管哪些扩展名。**小写、不带点**（写 `"rs"`，不是 `".rs"`）。
+    ///
+    /// 故意**不给默认值**：忘了写的话 serde 会直接报「缺 extensions」并指出行号，
+    /// 而给个空默认只会让它安静地什么都匹配不到 —— 那种错最难查。
+    pub extensions: Vec<String>,
+    /// 往上找这个文件当项目根；**不写 = 不要求项目根**，用文件自己所在的目录。
+    ///
+    /// 这两种语义差别很大：`rust-analyzer` 必须给一个真项目根（拿一个不包含
+    /// 这个文件的目录去糊它，实测 45 秒 0 份推送）；而 `clangd` 自己会往上找
+    /// `compile_commands.json`，我们硬要求它反而会把本来能用的项目排除掉。
+    #[serde(default)]
+    pub root_marker: Option<String>,
+    /// `didOpen` 里报的语言名；不写就用节名。
+    #[serde(default)]
+    pub language_id: Option<String>,
+}
+
+impl LspServer {
+    /// `didOpen` 里报的语言名。
+    pub fn language_id(&self) -> &str {
+        self.language_id.as_deref().unwrap_or(&self.name)
+    }
+
+    /// 这条服务器管不管带这个后缀的文件。
+    ///
+    /// 后缀在两边都小写、不带点；空后缀（没有后缀的文件）一律不管 ——
+    /// 那属于「按文件名而不是后缀认」的情况，现在不做。
+    pub fn handles(&self, extension: &str) -> bool {
+        !extension.is_empty()
+            && self
+                .extensions
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+    }
+}
+
+/// 内置的那几条服务器 —— 开箱就有。
+///
+/// 只放**各自生态里最标准的两个**：
+///
+/// - `rust-analyzer`：随 `rustup` 就有（`rustup component add rust-analyzer`）
+/// - `clangd`：随 LLVM 发行版就有，正好也是「不用微软那套」的选择
+///
+/// 别的语言**不内置** —— 没装的东西内置进去，「开箱即用」就变成
+/// 「开箱报一串找不到」，而那些提示会盖住真正有用的消息。想加就往配置里加一节。
+///
+/// ## 为什么 C 和 C++ 分两节
+///
+/// 因为 `languageId` 不一样，而 **`clangd` 靠它决定该怎么解析**。
+/// 尤其 `.h`：它既可能是 C 也可能是 C++，我们**不猜** —— 按下面这么写就是当 C 看；
+/// 想当 C++ 就把 `"h"` 从 `[lsp.c]` 那行挪到 `[lsp.cpp]`。
+///
+/// 两节的 `command` 相同，所以池子（按 **命令 + 根** 存会话）只会起**一个** clangd。
+fn default_lsp() -> HashMap<String, LspServer> {
+    let mut servers = HashMap::new();
+    let mut add = |name: &str, command: &str, extensions: &[&str], root_marker: Option<&str>| {
+        servers.insert(
+            name.to_string(),
+            LspServer {
+                name: name.to_string(),
+                command: command.to_string(),
+                args: Vec::new(),
+                extensions: extensions.iter().map(|ext| (*ext).to_string()).collect(),
+                root_marker: root_marker.map(|marker| marker.to_string()),
+                language_id: None,
+            },
+        );
+    };
+    add("rust", "rust-analyzer", &["rs"], Some("Cargo.toml"));
+    add("c", "clangd", &["c", "h"], None);
+    add(
+        "cpp",
+        "clangd",
+        &["cpp", "cc", "cxx", "hpp", "hxx", "hh"],
+        None,
+    );
+    servers
+}
+
+/// 文件后缀（小写、不带点）；没有后缀就空串。
+///
+/// 跟「有没有扩展名」的判定一致：`.gitignore` 这种点开头的**没有后缀**
+/// （`Path::extension` 就是这个规矩），所以它不会被当成 `gitignore` 类型的文件。
+fn extension_of(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 /// 加载配置文件的结果：配置本体 + 来源 + 需要提示给用户的问题。
@@ -443,9 +606,54 @@ pub struct LoadedConfig {
 impl Config {
     /// 解析一段 TOML 文本。只做「文本 → Config + 合法性检查」，不碰磁盘。
     pub fn parse(text: &str) -> Result<Self, String> {
-        let config: Self = toml::from_str(text).map_err(|err| flatten_error(&err, text))?;
+        let mut config: Self = toml::from_str(text).map_err(|err| flatten_error(&err, text))?;
+        config.prepare_lsp();
         config.validate()?;
         Ok(config)
+    }
+
+    /// 把 `[lsp]` 这张表整理成能用的样子。
+    ///
+    /// 两件事，顺序不能反：
+    ///
+    /// 1. **内置的并进来**（配置文件里同名的覆盖内置的）。
+    ///    没这一步的话，一份只写了 `[lsp.python]` 的配置会把 Rust 那条踢掉 ——
+    ///    现象是「Rust 诊断突然没了」，而矛头会指向完全无关的地方。
+    /// 2. **把节名填进每一节**（`language_id` 没写时靠它兜底）。
+    ///    节名是表的**键**，不在那一节里面，所以 serde 看不到它。
+    fn prepare_lsp(&mut self) {
+        for (name, spec) in default_lsp() {
+            self.lsp.entry(name).or_insert(spec);
+        }
+        for (name, spec) in &mut self.lsp {
+            spec.name = name.clone();
+        }
+    }
+
+    /// 这个文件该用哪个服务器（按**扩展名**找）。
+    ///
+    /// 找不到就返回 `None` —— 那意味着**一个字节都不发**。这一点很要紧：
+    /// 以前是「往上找到 `Cargo.toml` 就把文件丢给 `rust-analyzer`」，
+    /// 于是在 Rust 项目里打开 `.py`，会拿 rust-analyzer 去解析 Python，
+    /// 报出一堆**假的**语法错误（实测：4 条 `expected an item`）。
+    /// 假错误比没有诊断糟得多 —— 你会去改本来没错的代码。
+    ///
+    /// ⚠️ **按名字排一遍再找**。`HashMap` 的遍历顺序是随机的，
+    /// 要是两节都声称管 `.h`，「谁赢」会**每跑一次都可能不一样** ——
+    /// 那是这类代码里最难查的一种不稳定。排完序之后规则是确定的：
+    /// 节名（字典序）靠前的赢。
+    ///
+    /// `command` 留空的那条**直接跳过** —— 那是「这条我不要了」的写法，
+    /// 用来关掉一条内置的（比如你不想要 `clangd`）。
+    pub fn server_for(&self, path: &str) -> Option<&LspServer> {
+        let extension = extension_of(path);
+        let mut named: Vec<(&String, &LspServer)> = self.lsp.iter().collect();
+        named.sort_by_key(|(name, _)| name.as_str());
+        named
+            .into_iter()
+            .map(|(_, spec)| spec)
+            .filter(|spec| !spec.command.is_empty())
+            .find(|spec| spec.handles(&extension))
     }
 
     /// 按 [`Self::candidate_paths`] 的顺序加载配置。
@@ -598,6 +806,21 @@ impl Config {
                 self.lsp_max_servers
             ));
         }
+        for (name, spec) in &self.lsp {
+            for extension in &spec.extensions {
+                // ⚠️ 犯这个错太容易了 —— 后缀看着就像要带个点。
+                //    不报的话它只是安静地什么也匹配不到（`handles` 比的是不带点的），
+                //    现象是「我配了 clangd 但 .c 文件没诊断」。
+                if extension.starts_with('.') {
+                    return Err(format!(
+                        "lsp.{name}: extensions must not start with a dot, so write \"c\" rather than \".c\""
+                    ));
+                }
+                if extension.is_empty() {
+                    return Err(format!("lsp.{name}: extensions must not be empty"));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -627,6 +850,77 @@ pub fn executable_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+/// 配置里那个 `command` 到底跑不跑得起来 —— 找得到就返回它的**完整路径**。
+///
+/// ## 它回答的是哪句话
+///
+/// 「我都没下载这个 LSP，它怎么跑起来的？」以及反过来的「我明明装了，怎么不动？」
+///
+/// ⚠️ **我们只认 `PATH` 上的命令。** VS Code 扩展**打包在里面**的那些服务器
+/// （`pyright`、`jdtls`……）`PATH` 上没有，我们也看不见 —— 所以「装了扩展」
+/// 和「我们找得到」是两件不相干的事。这条差别正是那句话的来源：
+/// 用户以为「装了扩展就有了」，而我们的答案是「`PATH` 上没有」。
+///
+/// 判据和终端保持一致：
+/// - 命令里**带路径分隔符** → 当路径用（相对路径按当前目录算），不再去 `PATH` 里找；
+/// - 否则一项一项找 `PATH`，每一项里先试**原名**，再试 `.exe` / `.cmd` … 后缀。
+///
+/// 「先试原名」是照 Windows 自己的顺序来的（磁盘上那个文件叫 `clangd.exe`，
+/// 但你敲的、以及配置里写的是 `clangd`）。
+pub fn which(command: &str) -> Option<PathBuf> {
+    let command = command.trim();
+    if command.is_empty() {
+        // `command = ""` 在配置里的意思是「这条关掉」。它不是「去找一个叫
+        // 空字符串的程序」，所以这里不能装作找到什么。
+        return None;
+    }
+
+    if command.contains(['/', '\\']) {
+        // 写成了路径（绝对或相对）→ 就当路径看，不去打扰 PATH
+        return candidates(command).into_iter().find(|p| p.is_file());
+    }
+
+    let dirs: Vec<PathBuf> = match std::env::var_os("PATH") {
+        Some(raw) => std::env::split_paths(&raw).collect(),
+        // 没有 PATH（几乎不可能）——那一个裸名字确实无处可找
+        None => Vec::new(),
+    };
+    search_in_path(command, &dirs)
+}
+
+/// 在给定的几个目录里找一个命令（**这一半是纯的**，所以能直接测）。
+///
+/// `which` 只是把 `PATH` 拆开喂进来；「怎么判一个候选」这件事住在这儿，
+/// 因为它的错法（把 `clangd.exe` 漏掉）在界面上只表现为「找不到」。
+fn search_in_path(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        for candidate in candidates(command) {
+            // `PATH` 里的空项在约定上就是「当前目录」（`.;C:\bin` 这种写法）
+            let full = if dir.as_os_str().is_empty() {
+                candidate
+            } else {
+                dir.join(candidate)
+            };
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+/// 「这个命令在这个目录里可能叫什么」——原名优先，然后才是那几个后缀。
+///
+/// ⚠️ 顺序不是随便的：Windows 自己也是先试原名。磁盘上同时有 `clangd` 和
+/// `clangd.exe` 时，该赢的是前者 —— 那是用户**明确**指的那一个。
+fn candidates(command: &str) -> Vec<PathBuf> {
+    const SUFFIXES: &[&str] = &["", ".exe", ".cmd", ".bat", ".com"];
+    SUFFIXES
+        .iter()
+        .map(|suffix| PathBuf::from(format!("{command}{suffix}")))
+        .collect()
 }
 
 /// 平台相关的「stbd 配置目录」。
@@ -768,13 +1062,108 @@ side_scroll_margin = 2
         assert!(Config::load_from_file(&missing).is_err());
     }
 
+    // ---------- 找命令（`which`）----------
+
+    /// 造一个「PATH 里的一项」，里面放几个空文件冒充程序。
+    fn fake_path_dir(name: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stbd-which-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        for file in files {
+            std::fs::write(dir.join(file), "假装是个程序").expect("写临时文件");
+        }
+        dir
+    }
+
+    /// 裸名字要在 PATH 里找得到 —— 而且找的是 `.exe` 那个。
+    ///
+    /// 这是 `:lsp` 那张表里「找得到吗」那一列的**唯一**判据。它答错的后果是
+    /// 用户拿着一张说「找不到」的表去改一份本来就对的配置。
+    #[test]
+    fn a_bare_name_is_found_inside_a_path_entry() {
+        let dir = fake_path_dir("bare", &["findme.exe"]);
+        assert_eq!(
+            search_in_path("findme", std::slice::from_ref(&dir)),
+            Some(dir.join("findme.exe"))
+        );
+
+        // 找不到就是找不到 —— 别把「没这个文件」说成「有」
+        assert_eq!(
+            search_in_path("nothing-here", std::slice::from_ref(&dir)),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ⚠️ 磁盘上同时有 `findme` 和 `findme.exe` 时，赢的是**没有后缀**的那个。
+    ///
+    /// Windows 自己就是这个顺序（先试原名）。顺序反了的话，一个目录里
+    /// 放着一个叫 `clangd` 的脚本和一个叫 `clangd.exe` 的真程序时，
+    /// 我们报的路径会跟系统实际跑的不是同一个 —— 而两个都「找得到」，
+    /// 屏幕上完全看不出区别。
+    #[test]
+    fn the_plain_name_wins_over_the_one_with_a_suffix() {
+        let dir = fake_path_dir("order", &["findme", "findme.exe"]);
+        assert_eq!(
+            search_in_path("findme", std::slice::from_ref(&dir)),
+            Some(dir.join("findme"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PATH 的**第一项**先赢 —— 和系统一样，不挑「更晚的但更完整的」。
+    #[test]
+    fn the_first_path_entry_wins() {
+        let first = fake_path_dir("first", &["findme.exe"]);
+        let second = fake_path_dir("second", &["findme.exe"]);
+
+        assert_eq!(
+            search_in_path("findme", &[first.clone(), second]),
+            Some(first.join("findme.exe"))
+        );
+
+        std::fs::remove_dir_all(&first).ok();
+    }
+
+    /// ⚠️ `command = ""` 的意思是「把这条关掉」，**不是**「找一个没名字的程序」。
+    ///
+    /// 这里要是返回点什么（比如当前目录），关掉一条内置的服务器就会变成
+    /// 「起了一个不知道是什么的东西」。
+    #[test]
+    fn an_empty_command_finds_nothing() {
+        assert_eq!(which(""), None);
+        assert_eq!(which("   "), None);
+        assert_eq!(search_in_path("", &[std::env::temp_dir()]), None);
+    }
+
+    /// 写成了路径（带 `/` 或 `\`）就**不去 PATH 里翻**。
+    ///
+    /// 不去翻是重点：`./my-server` 该按「当前目录下这个文件**在不在**」来判，
+    /// 而不是「PATH 里有没有一个叫 `./my-server` 的」。后者永远找不到 ——
+    /// 于是「用相对路径指定自己的服务器」会静默失效。
+    #[test]
+    fn a_command_written_as_a_path_is_not_looked_up_in_path() {
+        assert_eq!(which("./definitely-not-here-9527"), None);
+        assert_eq!(which(r".\definitely-not-here-9527"), None);
+        assert_eq!(which(r"D:\definitely\not\here\9527.exe"), None);
+    }
+
     // ---------- 颜色 ----------
 
     #[test]
-    fn color_defaults_are_line_number_yellow_and_text_green() {
+    fn colour_defaults_keep_the_gutter_out_of_the_way() {
         let colors = Colors::default();
         assert_eq!(colors.text, Color::Green);
-        assert_eq!(colors.line_number, Color::Yellow);
+        // ⚠️ 行号是**背景设施** —— 它退成暗灰，黄色才能专门归警告用。
+        //    这两条得一起看：单独看任何一个都看不出「为什么是这个色」。
+        assert_eq!(colors.line_number, Color::DarkGray);
+        assert_eq!(colors.warning, Color::LightYellow);
+        assert_ne!(
+            colors.line_number, colors.warning,
+            "行号和警告抢同一个颜色的话，行号栏上就分不出「没毛病」和「有警告」"
+        );
+        assert_ne!(colors.warning, colors.error, "警告和错误不能同色");
         // 默认高亮 = 原来的 Indexed(236) = #303030
         assert_eq!(colors.current_line_bg, Color::Rgb(0x30, 0x30, 0x30));
         assert_eq!(Config::default().colors, Colors::default());
@@ -931,7 +1320,7 @@ side_scroll_margin = 2
     fn describe_renders_current_settings() {
         assert_eq!(
             Config::default().describe(),
-            "number=on tabwidth=8 scrolloff=3 sidescrolloff=5 lsp=2"
+            "number=on tabwidth=8 scrolloff=3 sidescrolloff=5 lsp=3"
         );
 
         let config = Config {
@@ -943,7 +1332,7 @@ side_scroll_margin = 2
         };
         assert_eq!(
             config.describe(),
-            "number=off tabwidth=2 scrolloff=0 sidescrolloff=1 lsp=2"
+            "number=off tabwidth=2 scrolloff=0 sidescrolloff=1 lsp=3"
         );
     }
 
@@ -990,5 +1379,257 @@ side_scroll_margin = 2
             ..Config::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    // ---------- 语言服务器表 ----------
+
+    /// 内置的那几条：Rust 一条，clangd 两条（C 和 C++ 分开，因为 `languageId`
+    /// 不一样，而 clangd 靠它决定怎么解析）。
+    #[test]
+    fn the_builtin_table_covers_rust_and_c_and_cpp() {
+        let config = Config::default();
+
+        let rust = config.server_for("src/main.rs").expect("Rust 该有服务器");
+        assert_eq!(rust.command, "rust-analyzer");
+        assert_eq!(rust.language_id(), "rust");
+        assert_eq!(rust.root_marker.as_deref(), Some("Cargo.toml"));
+
+        let c = config.server_for("a.c").expect("C 该有服务器");
+        assert_eq!(c.command, "clangd");
+        assert_eq!(
+            c.language_id(),
+            "c",
+            "languageId 得是 c，不然 clangd 会按 C++ 解析"
+        );
+        assert_eq!(c.root_marker, None, "clangd 不要求项目根");
+
+        let cpp = config.server_for("a.cpp").expect("C++ 该有服务器");
+        assert_eq!(cpp.command, "clangd");
+        assert_eq!(cpp.language_id(), "cpp");
+
+        // 扩展名大小写不敏感（Windows 上 `.C` 和 `.c` 是同一个东西）
+        assert_eq!(config.server_for("A.C").map(|s| s.language_id()), Some("c"));
+    }
+
+    /// ⚠️ **没有对应的服务器就返回 `None`，一个字节都不发。**
+    ///
+    /// 这条守着那个实测出来的坑：以前是「找到 `Cargo.toml` 就把文件丢给
+    /// rust-analyzer」，于是在 Rust 项目里打开 `.py`，它会拿 **Rust 的语法**
+    /// 去解析 Python，报出 4 条假的 `expected an item`。
+    /// 假错误比没有诊断糟得多 —— 你会去改本来没错的代码。
+    #[test]
+    fn a_file_with_no_server_gets_nothing_at_all() {
+        let config = Config::default();
+
+        for path in [
+            "script.py",
+            "app.js",
+            "notes.txt",
+            "Makefile",   // 没有扩展名
+            ".gitignore", // 点开头 —— 那不是「后缀是 gitignore 的文件」
+        ] {
+            assert!(
+                config.server_for(path).is_none(),
+                "{path} 不该匹配到任何服务器"
+            );
+        }
+    }
+
+    /// ⚠️ 配置文件里那张表是**并进**内置默认，**不是替换它**。
+    ///
+    /// 替换的话，一份只写了 `[lsp.python]` 的配置会把 Rust 那条踢掉 ——
+    /// 现象是「Rust 诊断突然没了」，而矛头会指向完全无关的地方。
+    #[test]
+    fn a_config_section_merges_into_the_builtins_instead_of_replacing_them() {
+        let config = Config::parse(
+            r#"
+[lsp.zig]
+command = "zls"
+extensions = ["zig"]
+"#,
+        )
+        .expect("该能解析");
+
+        assert_eq!(
+            config.server_for("a.zig").map(|s| s.command.as_str()),
+            Some("zls")
+        );
+        assert!(
+            config.server_for("a.rs").is_some(),
+            "只写了一节，Rust 那条就没了 —— 合并写成替换了"
+        );
+        assert_eq!(
+            config.server_for("a.zig").map(|s| s.language_id()),
+            Some("zig")
+        );
+    }
+
+    /// **一节 `[lsp]` 都不写的配置**（也就是所有老配置）必须照旧拿到内置那三条。
+    ///
+    /// ## 它和已有测试重叠，这是故意的
+    ///
+    /// `Config::parse("") == Config::default()` 那条已经盖住了同样的路，
+    /// 只是盖得很笼统。这条分开写是为了**把症状说出来**：真断了的时候，
+    /// 用户看到的是「升级之后所有老配置的人突然全没了诊断」，
+    /// 而第一反应是怀疑自己把配置改坏了。
+    ///
+    /// ## 它**不能**证明的事（红检发现的）
+    ///
+    /// 我原来以为它守着 `#[serde(default = "default_lsp")]`。红检时把那个
+    /// 默认值摘掉，它**照样绿** —— 因为内置三条其实是
+    /// [`Config::prepare_lsp`] 并进来的（`Config::parse` 的必经之路），
+    /// serde 那层只是「字段可以不在」。所以那条属性已经改成光秃秃的
+    /// `#[serde(default)]`，内置表只剩一个入口。
+    ///
+    /// 真正被这条测试守住的是 `prepare_lsp` 里那句 `entry().or_insert(...)` ——
+    /// 把它删掉，这条和 `a_config_section_merges_into_the_builtins_...` 一起红。
+    #[test]
+    fn a_config_without_any_lsp_section_still_gets_the_builtins() {
+        // 用真的老配置的样子：有个顶层键，但没有 [lsp]
+        let config = Config::parse("tab_width = 8\n").expect("老配置该能解析");
+
+        assert_eq!(
+            config.server_for("a.rs").map(|s| s.command.as_str()),
+            Some("rust-analyzer")
+        );
+        assert_eq!(
+            config.server_for("a.c").map(|s| s.command.as_str()),
+            Some("clangd")
+        );
+        assert_eq!(
+            config.server_for("a.cpp").map(|s| s.command.as_str()),
+            Some("clangd")
+        );
+
+        // 默认值本身也得有 —— `Config::default()` 是**手写的**（不是 derive），
+        // 漏掉一行 `lsp: default_lsp()` 是这条路上最可能的错法
+        assert_eq!(Config::default().lsp.len(), 3);
+    }
+
+    /// 同名的一节会**盖住**内置的那条（这是「改默认值」的正路）。
+    #[test]
+    fn a_section_with_a_builtin_name_overrides_it() {
+        let config = Config::parse(
+            r#"
+[lsp.rust]
+command = "my-analyzer"
+args = ["--stdio"]
+extensions = ["rs"]
+"#,
+        )
+        .expect("该能解析");
+
+        let rust = config.server_for("a.rs").expect("该有");
+        assert_eq!(rust.command, "my-analyzer");
+        assert_eq!(rust.args, vec!["--stdio"]);
+        assert_eq!(rust.root_marker, None, "没写就是没写，不该继承旧的");
+    }
+
+    /// `command` 留空 = **这条不要了**（用来关掉一条内置的）。
+    #[test]
+    fn an_empty_command_turns_a_builtin_off() {
+        let config = Config::parse(
+            r#"
+[lsp.c]
+command = ""
+extensions = ["c", "h"]
+"#,
+        )
+        .expect("该能解析");
+
+        assert!(
+            config.server_for("a.c").is_none(),
+            "command 留空该等于关掉那条"
+        );
+        assert!(config.server_for("a.cpp").is_some(), "不该殃及别的节");
+    }
+
+    /// 后缀写成 `.c`（带点）是最容易犯的错 —— 必须报错，而且说清怎么写。
+    ///
+    /// 不报的话它只是安静地什么都匹配不到，现象是「我配了 clangd 但没诊断」。
+    #[test]
+    fn an_extension_written_with_a_dot_is_rejected() {
+        let err = Config::parse(
+            r#"
+[lsp.zig]
+command = "zls"
+extensions = [".zig"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("lsp.zig"), "该说清是哪一节：{err}");
+        assert!(err.contains("dot"), "该说清错在哪：{err}");
+    }
+
+    /// 两节都声称管同一个后缀时，**节名字典序靠前的赢** —— 而且是确定的。
+    ///
+    /// `HashMap` 的遍历顺序是随机的；不排序的话「谁赢」会每跑一次都可能不一样，
+    /// 那是这类代码里最难查的一种不稳定。
+    #[test]
+    fn two_sections_claiming_one_extension_resolve_deterministically() {
+        let text = r#"
+[lsp.c]
+command = "c-server"
+extensions = ["h"]
+
+[lsp.cpp]
+command = "cpp-server"
+extensions = ["h"]
+"#;
+
+        // 多解析几遍：真要是靠 HashMap 的随机顺序，这里迟早会翻。
+        for _ in 0..20 {
+            let config = Config::parse(text).expect("该能解析");
+            assert_eq!(
+                config.server_for("a.h").map(|s| s.command.as_str()),
+                Some("c-server"),
+                "节名靠前的该赢，而且每次都该是它"
+            );
+        }
+    }
+
+    /// 节名就是 `languageId` 的默认值 —— 最常见的情况（节名就是语言名）
+    /// 不用写两遍。写了 `language_id` 则以它为准。
+    #[test]
+    fn the_section_name_becomes_the_language_id_unless_overridden() {
+        let config = Config::parse(
+            r#"
+[lsp.zig]
+command = "zls"
+extensions = ["zig"]
+
+[lsp.mylang]
+command = "my-server"
+extensions = ["mylang"]
+language_id = "plaintext"
+"#,
+        )
+        .expect("该能解析");
+
+        assert_eq!(
+            config.server_for("a.zig").map(|s| s.language_id()),
+            Some("zig")
+        );
+        assert_eq!(
+            config.server_for("a.mylang").map(|s| s.language_id()),
+            Some("plaintext")
+        );
+    }
+
+    /// 表里写错键名要报错，而且指出第几行 —— 跟别的配置一个待遇。
+    #[test]
+    fn a_typo_inside_a_server_section_is_reported_with_its_line() {
+        let err = Config::parse(
+            r#"
+[lsp.zig]
+comand = "zls"
+extensions = ["zig"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("line 3"), "该指出第 3 行：{err}");
+        assert!(err.contains("comand"), "该指出写错的键名：{err}");
     }
 }

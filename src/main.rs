@@ -50,10 +50,9 @@ fn main() -> io::Result<()> {
 
     // 1.5 把输出文件夹清一遍。
     //
-    // 为什么**进入**也要清：上一次那个程序可能是**崩掉**的，没走到退出那一步，
-    // 于是 `file_list.txt` 里还留着上一次的内容 —— 而它看起来跟这一次的一模一样，
-    // 你会拿着上次的列表当这次的用。「进入和退出各清一次」听起来像重复，
-    // 实际上清的分别是「上一次失败留下的」和「这一次留下的」。
+    // **进入时清一次就够了**（退出时不清，理由见 `main` 末尾）。
+    // 这一次清掉的是上一次留下的东西 —— 不管上次是正常退出还是崩掉的：
+    // 上一次的内容看起来跟这一次的一模一样，你会拿着上次的列表当这次的用。
     Outbox::locate().clean();
 
     // 2. 读用户配置：找不到文件就用默认值；文件写错了也不致命，只记下提示
@@ -94,13 +93,16 @@ fn main() -> io::Result<()> {
     let result = run_event_loop(&mut terminal, &mut app);
     release_terminal()?;
 
-    // 6. 把输出文件夹清一遍再走。
+    // ⚠️ 退出时**不**清输出文件夹。
     //
-    // ⚠️ 进入时（在 `main` 开头那一次）也清一遍，不是重复：
-    //    上一次的程序可能是**崩掉**的，根本没走到这里 —— 只清退出的话，
-    //    下次打开会看见上一次的残留，而它看起来跟这一次的一模一样。
-    Outbox::locate().clean();
-
+    // 这里曾经也清一次，理由是「进入时那次不够，上次可能是崩掉的」——
+    // 但仔细读那句话会发现它在说**进入**那次有必要，没说退出那次有什么用。
+    // 而退出那次的代价是实测出来的：`:errors` 之后一 `:q`，`error_log.txt`
+    // 就空了 —— 于是「把清单写成文件」这件事只剩下「编辑器开着时另一个窗口
+    // 去读它」，退出之后就拿不到了。
+    //
+    // 进入时那次已经足够：不管上次是正常退出还是崩掉，你打开时看到的
+    // 永远是干净的。下次打开时它自然会被清掉。
     result
 }
 
@@ -198,6 +200,13 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
                             // 让位：终端暂时交出去，回来之后界面还是原样
                             Step::HandOver(line) => run_external_command(terminal, app, &line),
                             Step::StartCheck => check = start_check(app),
+                            // 正文在这里拼（要池子），拼完铺上去、再拄进输出文件夹 ——
+                            // 和 `:ls` / `:errors` 一样：**屏幕上显示的就是拄出去的那份**
+                            Step::ShowLspStatus => {
+                                let text = lsp_status(&app.config, &lsp.running());
+                                app.show_list(DocumentKind::LspStatus, text);
+                                write_outbox(app, OutFile::LspStatus);
+                            }
                             Step::Continue => {}
                         }
                     }
@@ -286,17 +295,6 @@ fn start_check(app: &mut App) -> Option<mpsc::Receiver<check::CheckReport>> {
 
 // ---------- 语言服务器 ----------
 
-/// 我们要起的那个服务器。以后要支持别的语言，就从这里长出一个配置项。
-const LSP_COMMAND: &str = "rust-analyzer";
-
-/// 给它的命令行参数。
-///
-/// ⚠️ 空数组是**故意的**：`rust-analyzer` 不带参数时走的就是 stdio（我们唯一
-/// 支持的那条路）。网上到处能看到 `--stdio`，那是别的编辑器为了**明确要求**
-/// 它别去猜别的传输方式 —— 而在最新版里它已经是个不认得的参数了。
-/// 写上去只会让它启动失败，而失败的样子是「诊断一条都没有」，很难查。
-const LSP_ARGS: &[&str] = &[];
-
 /// 拿这个文件去找它的**项目根**。
 ///
 /// 服务器要的是根，不是当前这个文件 —— 我们打开的是 `src/main.rs`，
@@ -311,18 +309,44 @@ const LSP_ARGS: &[&str] = &[];
 /// 服务器对它一个字都不说（实测 45 秒 0 份推送），而屏幕上什么都不显示 ——
 /// 看起来就像「这个文件恰好没问题」。
 ///
-/// 找不到根（不是一个 Cargo 项目）时返回 `None`。这是**正常**情况：拿它编辑
-/// 一个单独的 `.txt`，凭什么要求它是个 Rust 项目。所以这里不报错、不提示。
-fn project_root_of(path: &str) -> Option<PathBuf> {
-    file_io::find_upwards(Path::new(path), "Cargo.toml")
+/// `marker` 从哪来：配置里那一节的 `root_marker`。**不写标记**（`None`）时
+/// 返回文件自己所在的目录 —— 有些服务器不要求项目根（`clangd` 自己会往上找
+/// `compile_commands.json`），硬要求它反而会把本来能用的项目排除掉。
+///
+/// 找不到标记时返回 `None`，调用方**不起服务器**。这是**正常**情况：
+/// 拿它编辑一个单独的 `.rs`，凭什么要求它是个 Cargo 项目。所以不报错、不提示。
+fn project_root_of(path: &str, marker: Option<&str>) -> Option<PathBuf> {
+    // ⚠️ 相对路径**直接不给根**。两个反直觉的地方叠在一起：
+    //
+    //   1. `Path::new("x.c").parent()` 是 `Some("")`，不是 `None` ——
+    //      照直用会拿着一个空路径去求 rootUri；
+    //   2. 相对路径喂给 `find_upwards`，它是**按进程当前目录**去找标记的 ——
+    //      于是「这个文件属于哪个项目」取决于你在哪个目录敲的
+    //      `cargo run` / `cargo test`。同一个文件两次跑给出两个不同的根，
+    //      而错的那个表现是「一个字都不说的服务器」，屏幕上毫无提示。
+    //
+    // 正常流程里进不来（`file_io::full_path_in` 在打开那一刻就钉成绝对的了），
+    // 所以这是个零成本的防守 —— 而要查的毛病很难查。
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let Some(marker) = marker else {
+        // 不要求项目根 → 就用文件自己所在的目录。
+        // 绝对路径的父目录一定拿得到，所以这里不会空手而归。
+        return path.parent().map(Path::to_path_buf);
+    };
+    file_io::find_upwards(path, marker)
 }
 
 /// 报告事实：**现在屏幕上是这个文件、这些文本**。
 ///
-/// 这里干三件事，顺序不能乱：
+/// 这里干四件事，顺序不能乱：
 /// 1. 把上限从配置同步给池子（`:set` / `:config reload` 改的都算数）
-/// 2. 算出这个文件属于哪个项目根，拿到那个根的会话（没有就起一个）
-/// 3. 把「现在是什么」告诉它
+/// 2. 查表：这个后缀归哪个服务器；**查不到就什么都不做**
+/// 3. 算出这个文件属于哪个项目根，拿到「那个服务器的那个根」的会话
+/// 4. 把「现在是什么」告诉它
 ///
 /// 要不要真的发消息，由 [`Session::show`] 自己判断（一个字没变就什么都不发）。
 fn sync_document(pool: &mut Pool, app: &mut App) {
@@ -341,7 +365,7 @@ fn sync_document(pool: &mut Pool, app: &mut App) {
 
     // ⚠️ **只有真文件才同步。**
     //
-    // 目录列表不是源代码。更要紧的是以后那个 `:errors` 视图 —— 它是一份
+    // 目录列表不是源代码。更要紧的是 `:errors` 那个清单 —— 它是一份
     // **我们生成的**文本，要是也发过去，服务器会认认真真地给你报
     // 「这一堆字里有语法错误」，然后那些错又会显示在屏幕上。
     if app.kind != DocumentKind::File {
@@ -350,7 +374,20 @@ fn sync_document(pool: &mut Pool, app: &mut App) {
     let Some(path) = app.file_path.clone() else {
         return;
     };
-    let Some(root) = project_root_of(&path) else {
+
+    // ⚠️ 查不到就**一个字节都不发**。以前这里是「找到 Cargo.toml 就丢给
+    //    rust-analyzer」，于是在 Rust 项目里打开 `.py` 会让 rust-analyzer
+    //    拿 Rust 语法去解析 Python，报出一堆**假的**语法错误
+    //    （实测：4 条 `expected an item`）。假错误比没有诊断糟得多 ——
+    //    你会去改本来没错的代码。
+    //
+    //    `command` 留空（= 关掉一条内置的）也会在这里变成 `None` ——
+    //    那条规则住在 `server_for` 里，不在这儿。
+    let Some(server) = app.config.server_for(&path) else {
+        return;
+    };
+
+    let Some(root) = project_root_of(&path, server.root_marker.as_deref()) else {
         return;
     };
     let Some(uri) = lsp::uri::path_to_uri(Path::new(&path)) else {
@@ -361,16 +398,19 @@ fn sync_document(pool: &mut Pool, app: &mut App) {
     };
 
     let text = app.buffer.to_string();
-    let language = lsp::session::language_id(&path);
+    let language = server.language_id();
+    let command = server.command.clone();
+    let args: Vec<&str> = server.args.iter().map(String::as_str).collect();
 
     // 先拿到会话，再说话 —— 分两步是因为 `acquire` 要可变借池子，
     // 而 `show` 要可变借那个会话，同一个表达式里做不到
-    let outcome = match pool.acquire(&root_uri, || {
-        Session::start(LSP_COMMAND, LSP_ARGS, Some(root.as_path()), Some(&root_uri))
+    let outcome = match pool.acquire(&command, &root_uri, || {
+        Session::start(&command, &args, Some(root.as_path()), Some(&root_uri))
     }) {
         Ok(session) => session.show(&uri, language, &text).err(),
-        // 起不来。⚠️ 同一个根**只报一次** —— 这句话每按一个键就刷一遍的话，
-        // 会把 `:w` 那句「Saved foo.rs」冲掉，用户就看不见自己保存成功了
+        // 起不来（最常见的就是那个命令没装）。⚠️ 同一把钥匙**只报一次** ——
+        // 这句话每按一个键就刷一遍的话，会把 `:w` 那句「Saved foo.rs」冲掉，
+        // 用户就看不见自己保存成功了
         Err(failure) if !failure.already_reported => {
             app.set_status_message(format!("LSP: {}", failure.reason));
             None
@@ -390,11 +430,19 @@ fn sync_document(pool: &mut Pool, app: &mut App) {
 /// `redraw` 会被改成 `true`：诊断来了行号栏的颜色就变了，必须重画 ——
 /// 否则新颜色要等你下次按键才出现，看起来就像「它反应很慢」。
 fn drain_lsp(pool: &mut Pool, app: &mut App, redraw: &mut bool) {
-    for (_root_uri, outcome) in pool.poll_all() {
-        match outcome {
+    for spoken in pool.poll_all() {
+        match spoken.outcome {
             // 握上手了。说一句，**只一次**（每个会话各说一次）——
             // 不然「这个文件没问题」和「服务器根本没连上」在屏幕上长得一模一样。
-            Outcome::Ready => app.set_status_message("LSP: rust-analyzer is ready"),
+            //
+            // ⚠️ 名字**必须**用 `spoken.command`，不能写死。这里原来是一句
+            //    `"LSP: rust-analyzer is ready"` 的字面量 —— 只有 rust-analyzer
+            //    的年代看不出来，配了 clangd 之后就成了**假消息**：起了 clangd，
+            //    屏幕上却说 rust-analyzer。而这句话是用户唯一能确认
+            //    「服务器到底起没起」的地方（手动冒烟测试时就是这么被骗了一次）。
+            Outcome::Ready => {
+                app.set_status_message(format!("LSP: {} is ready", spoken.command));
+            }
             Outcome::Diagnostics(push) => {
                 // 它也会报**别的文件**（我们刚关掉的那个、`build.rs`……），
                 // 而且不同的根还会各报各的。只认现在屏幕上这个 ——
@@ -409,20 +457,54 @@ fn drain_lsp(pool: &mut Pool, app: &mut App, redraw: &mut bool) {
             }
             // 线断了。不需要在这里做什么收摊 —— `Pool::poll_all` 已经把它
             // 从池子里摘掉了（`drop` 顺带收尸），我们只负责说一句。
-            Outcome::Broken(why) => app.set_status_message(format!("LSP: {why}")),
+            Outcome::Broken(why) => {
+                app.set_status_message(format!("LSP: {why}"));
+            }
         }
     }
 }
 
-/// 这条诊断推送说的是**现在屏幕上的那个文件**吗。
+/// 这条诊断推送说的是**现在我们打开的那个文件**吗。
 ///
 /// ⚠️ 用 [`lsp::uri::same_file`] 比，**不能比字符串**：我们发出去的是
 /// `file:///D:/...`，它回来的是 `file:///d:/...`（实测），字符串相等永远是假
 /// —— 于是表现成「诊断一条都不显示」，而服务器那头一切正常，两头都看不出毛病。
 ///
 /// 单独拆成函数是为了能直接测：它判错的后果（诊断全丢）在界面上看不出来。
+///
+/// ## ⚠️ 它只管「**存不存**」，不管「**画不画**」
+///
+/// 这两件事原来是混在一起的：这里曾经写着「不是普通文件就一律不认」，
+/// 理由是「清单是我们生成的文本，认了就会把诊断画到清单本身上」。
+/// 但那个理由管的是**画**，而这一层管的是**存** —— 结果多了一条没人想要的
+/// 副作用，实测出来的（2026-09-15，手动冒烟测试 A/B 对照）：
+///
+/// ```text
+/// A：打开坏文件 → 等 → `:errors`          → 报出 1 条错误   ✅
+/// B：打开坏文件 → `:lsp` → `q` → `:errors` → 「No problems」  ❌
+/// ```
+///
+/// 因为清单在屏幕上那段时间里到达的推送被**丢掉**了，而丢掉之后它
+/// **不会再回来** —— 服务器只在文本变了的时候才推，而文本一个字没动。
+/// 于是你从清单退回来，看到的是一个「干净」的文件。
+///
+/// `:lsp` 只是让这个坑更容易撞上（服务器还在启动时你就可能已经在看清单了）。
+/// 真正修的是把两个判断分开：
+///
+/// - **画**：`ui::line_number_colour` 遇到虚拟视图直接返回 `plain`
+///   （测试 `the_error_list_does_not_colour_its_own_line_numbers`）
+/// - **存**：就是这里 —— 只要说的是我们打开的那个文件，就先收下来
+///
+/// 于是从清单退回去时，行号栏上的标记是活的，而不是进清单那一刻的。
+///
+/// 目录列表那一支不受影响：它的 `file_path` 是个**目录**，
+/// 拿它去跟任何一个文件的 uri 比都是「不是」。
 fn is_current_file(app: &App, uri: &str) -> bool {
-    if app.kind != DocumentKind::File {
+    // 目录列表那个 `file_path` 是个**目录**，不是文件 —— 而诊断是长在文本上的。
+    //
+    // ⚠️ 判据是 [`DocumentKind::wraps_a_file`]，**不是** `is_virtual`。
+    // 用后者就顺手把「清单盖在屏幕上时推来的诊断」一起丢了（见上面那段实测）。
+    if !app.kind.wraps_a_file() {
         return false;
     }
     let Some(path) = app.file_path.as_deref() else {
@@ -493,6 +575,10 @@ enum Step {
     /// 同样得回主循环才能做：起线程、拿收件通道、以后每轮去 `try_recv` ——
     /// 这些都是「活着的东西」，不该让 [`run_action`] 碰。
     StartCheck,
+    /// 铺一份「语言服务器现在什么状况」的清单（`:lsp`）。
+    ///
+    /// 同样得回主循环：那份清单要说「现在跑着哪几个」，只有池子知道。
+    ShowLspStatus,
 }
 
 /// 执行一个动作，告诉主循环下一步干什么。
@@ -529,6 +615,8 @@ fn run_action(app: &mut App, action: Action) -> Step {
         Action::RunExternal(line) => return Step::HandOver(line),
         // 需要起线程 / 留通道，同样交回主循环
         Action::RunCheck => return Step::StartCheck,
+        // 正文要池子（「现在跑着哪几个」），交回主循环
+        Action::ShowLspStatus => return Step::ShowLspStatus,
         // 纯状态：把虚拟视图退掉，原来那份文档原样放回来（不需要读盘）
         Action::RestoreDocument => {
             if !app.restore_document() {
@@ -555,6 +643,105 @@ fn write_outbox(app: &mut App, file: OutFile) {
     if let Err(err) = Outbox::locate().write(file, &text) {
         app.set_status_message(format!("Cannot write {} ({err})", file.name()));
     }
+}
+
+/// `:lsp` 那一屏 —— 「配了哪些语言服务器、命令找不找得到、现在跑着几个」。
+///
+/// ## 为什么它值得一条命令
+///
+/// 语言服务器是**外部程序**：编辑器不带、也不会替你装。于是最常出现的两个
+/// 问题正好相反 —— 「我都没下载，它怎么跑起来的」和「我明明装了，怎么不动」。
+///
+/// 在这之前，屏幕上**没有任何地方**能看出配了什么、找不找得到：唯一那句话是
+/// 状态栏的 `LSP: clangd is ready`，而它只在**成功之后**才出现。失败的时候
+/// 你看到的是一模一样的安静 —— 和「这个文件恰好没问题」长得完全一样。
+///
+/// ## ⚠️ 底下那条「找不到」不代表你没装
+///
+/// 我们只认 `PATH` 上的命令。VS Code 扩展**打包在里面**的那些服务器
+/// （pyright、jdtls……）不在 `PATH` 上，我们也看不见 ——
+/// 「装了扩展」和「我们找得到」是两件不相干的事。这个区别正是那句话的来源，
+/// 所以表里写的是 **on PATH**，不是笼统的「找不到」。
+///
+/// 拆成纯函数（只要配置和「现在跑着哪几个」这两样**数据**，不要 `App`、
+/// 不要池子、不要真服务器）是为了能测：它说的每句话在 `main.rs` 的测试里
+/// 都能被钉住 —— 连「有几个在跑」那一支也能，因为那一支要的东西
+/// 恰好就是 `Pool::running()` 的返回值。
+fn lsp_status(config: &config::Config, running: &[(String, String)]) -> String {
+    let mut lines = vec![
+        format!(
+            "{} server(s) configured, {} running, limit {}",
+            config.lsp.len(),
+            running.len(),
+            config.lsp_max_servers
+        ),
+        String::new(),
+    ];
+
+    // ⚠️ 按节名排一遍。`HashMap` 的顺序是随机的 —— 不排的话同一台机器上
+    //    每敲一次 `:lsp` 行序都不一样，你会以为配置变了。
+    let mut named: Vec<(&String, &config::LspServer)> = config.lsp.iter().collect();
+    named.sort_by_key(|(name, _)| name.as_str());
+
+    for (name, server) in named {
+        lines.push(format!(
+            "{name}  [{}]  ->  {}",
+            server.extensions.join(" "),
+            if server.command.is_empty() {
+                "(off)"
+            } else {
+                server.command.as_str()
+            }
+        ));
+
+        if server.command.is_empty() {
+            // `command = ""` 就是「把这条关掉」—— 正是「为什么没反应」的答案之一，
+            // 所以要说出来，不能只是一片空白
+            lines.push("    off: this section's command is empty".to_string());
+            continue;
+        }
+
+        match config::which(&server.command) {
+            // ⚠️ **文件名在前、目录在下一行。**
+            //
+            // 一条路径被右边切掉时，先没的是**尾巴**，而尾巴恰恰是唯一
+            // 能认出「这是哪一个」的那一段（两条 `clangd` 的目录可能长得
+            // 几乎一样，区别只在最后）。实测过：一行到底的写法在 78 列的
+            // 终端里两条都显示成 `...clang+llvm-22.1.8-...` —— 表格看着
+            // 很整齐，但一点用都没有。
+            //
+            // 拆开之后，被切掉的只会是目录里最不重要的尾部。
+            Some(path) => {
+                lines.push(format!(
+                    "    ok  {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                if let Some(dir) = path.parent() {
+                    lines.push(format!("        {}", dir.display()));
+                }
+            }
+            // ⚠️ 这句话是**故意**写全的：只说「找不到」会让人去查 PATH 之外的东西
+            //    （比如「我扩展装了呀」）。把判据说出来，用户才知道该去改什么。
+            None => lines.push(format!(
+                "    NOT on PATH -- the editor still works, but {} gets no diagnostics",
+                server.extensions.join("/")
+            )),
+        }
+    }
+
+    lines.push(String::new());
+    if running.is_empty() {
+        // ⚠️ 空不等于「坏了」：服务器是**用到了才起**的，而且只在真文件上起 ——
+        //    所以停在目录列表里、或者这门语言的文件还没打开过，本来就该是空的。
+        lines.push("running now: none (servers start when a matching file is opened)".to_string());
+    } else {
+        lines.push(format!("running now ({})", running.len()));
+        for (command, root) in running {
+            lines.push(format!("    {command}  @  {root}"));
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// 把编辑器要的终端状态装回去（[`release_terminal`] 的逆操作），
@@ -823,6 +1010,226 @@ mod tests {
         assert_eq!(
             echo_command_line(r#"git  commit -m "a  b" && echo done"#),
             r#"!git  commit -m "a  b" && echo done"#
+        );
+    }
+
+    /// 不要求项目根的语言（`clangd`）拿到的是**文件自己所在的目录**。
+    ///
+    /// 这是 clangd 能不能用的**唯一**开关：`[lsp.c]` 那节没写 `root_marker`，
+    /// 于是走这条分支。要是这里返回 `None`，`.c` 文件就永远不起服务器 ——
+    /// 而屏幕上什么都不显示，看起来就像「这个文件恰好没问题」。
+    #[test]
+    fn a_language_that_needs_no_project_root_uses_the_files_own_directory() {
+        assert_eq!(
+            project_root_of("D:/proj/src/x.c", None),
+            Some(PathBuf::from("D:/proj/src"))
+        );
+        // 根目录下的文件：父目录是 `D:/`，不是空的
+        assert_eq!(project_root_of("D:/x.c", None), Some(PathBuf::from("D:/")));
+    }
+
+    /// ⚠️ **相对路径绝不能变成一个「根」。**
+    ///
+    /// 反直觉的一条：`Path::new("x.c").parent()` 是 `Some("")` 而**不是**
+    /// `None`（空路径确实是个「父目录」，只是没意义）。照直用就会拿着 `""`
+    /// 去求 rootUri，那是一条连不上任何项目的路。
+    ///
+    /// 正常流程里进不来 —— `file_io::full_path_in` 在打开那一刻就把路径钉成
+    /// 绝对的了。但这条分支值一毛钱的防守：代价为零，而错了以后的表现
+    /// 是「这个文件永远没诊断」，很难查。
+    #[test]
+    fn a_relative_path_never_becomes_a_project_root() {
+        assert_eq!(project_root_of("x.c", None), None);
+        assert_eq!(project_root_of("x.c", Some("Cargo.toml")), None);
+    }
+
+    /// 要求项目根的语言（`rust-analyzer`）真的**往上**找。
+    ///
+    /// 实测过一次错得很难看的样子：根算错时 rust-analyzer 对那个文件
+    /// 一个字都不说（45 秒 0 份推送），屏幕上同样毫无提示。
+    #[test]
+    fn a_marker_is_found_by_walking_upwards() {
+        let root = std::env::temp_dir().join("stbd-root-probe");
+        let nested = root.join("crates").join("inner").join("src");
+        std::fs::create_dir_all(&nested).expect("建临时目录");
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").expect("写标记文件");
+
+        let file = nested.join("main.rs");
+        let file = file.to_string_lossy().into_owned();
+        std::fs::write(&file, "fn main() {}\n").expect("写源文件");
+
+        assert_eq!(
+            project_root_of(&file, Some("Cargo.toml")),
+            Some(root.clone())
+        );
+        // 标记在 `/crates` 里 —— 那它就该停在那儿，不能一路窜到顶
+        assert_ne!(
+            project_root_of(&file, Some("Cargo.toml")),
+            Some(nested.clone())
+        );
+
+        // 找一个不存在的标记 → `None`（调用方据此**不起服务器**，不报错）
+        assert_eq!(project_root_of(&file, Some("build.gradle")), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---------- `:lsp` 那一屏 ----------
+
+    /// 造一份只含一条的配置，命令指哪儿由调用方说了算。
+    fn config_with(command: &str, extensions: &[&str]) -> config::Config {
+        let mut config = config::Config::default();
+        config.lsp.clear();
+        config.lsp.insert(
+            "zz".to_string(),
+            config::LspServer {
+                name: "zz".to_string(),
+                command: command.to_string(),
+                args: Vec::new(),
+                extensions: extensions.iter().map(|e| e.to_string()).collect(),
+                root_marker: None,
+                language_id: None,
+            },
+        );
+        config
+    }
+
+    /// 找得到的命令要报出**它的文件名和目录** —— 那是这张表的主要用处。
+    ///
+    /// ⚠️ 用**自己造的**绝对路径，不用 `clangd` / `rust-analyzer` 这种真名字：
+    /// 那样这条测试就变成了「这台机器装没装 clangd」，换台机器就红，
+    /// 而它要验的其实是「我们会不会把找到的位置说出来」。
+    /// （命令里带路径分隔符时不去翻 `PATH`，所以这条路是确定的。）
+    ///
+    /// ⚠️ 断言分成**两段**（文件名、目录）是刻意的 —— 它们**必须分两行**。
+    /// 一条到底的写法在窄终端里会被右边切掉，先没的正好是文件名，
+    /// 而那是唯一能认出「这是哪一个」的地方。
+    #[test]
+    fn the_lsp_list_says_where_the_command_was_found() {
+        let dir = std::env::temp_dir().join("stbd-lsp-status");
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let program = dir.join("my-server.exe");
+        std::fs::write(&program, "假装是个程序").expect("写临时文件");
+
+        let config = config_with(&program.to_string_lossy(), &["zz"]);
+        let text = lsp_status(&config, &[]);
+
+        assert!(text.contains("zz"), "要列出节名和它管的扩展名：{text}");
+
+        // ⚠️ 盯的是 `ok` 那一行，**不是**「哪一行里出现了文件名」——
+        //    表头那行印的是**配置里原样写的**命令，而这里的命令本身就是
+        //    一条路径，于是文件名在表头里也出现了一次。找第一处会找错行
+        //    （第一版就是这么红的）。
+        let lines: Vec<&str> = text.lines().collect();
+        let ok_at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ok"))
+            .unwrap_or_else(|| panic!("该报「找得到」：{text}"));
+        assert!(
+            lines[ok_at].contains("my-server.exe"),
+            "要找得到就说清**是哪一个** —— 文件名得在这一行：{text}"
+        );
+        // 紧接着的下一行是目录 —— 而不是把整条路径挤在同一行里
+        assert_eq!(
+            lines.get(ok_at + 1).map(|line| line.trim()),
+            Some(dir.to_string_lossy().as_ref()),
+            "文件名之后该跟一行目录：{text}"
+        );
+        // 表头那行该是**配置里原样写的**东西：查「我改的配置生效了吗」全靠它
+        assert!(
+            lines[2].contains(&program.to_string_lossy().to_string()),
+            "表头该原样印出配置里写的命令：{text}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 找不到的命令要说 **on PATH** 这个词。
+    ///
+    /// 为什么非要这两个字：用户看到「找不到」的第一反应是「可我扩展装了呀」——
+    /// 而 VS Code 扩展打包在里面的服务器（pyright、jdtls）本来就不在 `PATH` 上。
+    /// 把判据说出来，他才知道该去改什么；只说「找不到」等于让他去查一个
+    /// 我们根本没看过的地方。
+    #[test]
+    fn a_missing_command_is_blamed_on_path_specifically() {
+        let config = config_with("definitely-not-a-real-program-9527", &["zz"]);
+        let text = lsp_status(&config, &[]);
+
+        assert!(text.contains("PATH"), "要把判据说出来：{text}");
+        assert!(
+            text.contains("zz"),
+            "要说清「是哪门语言没诊断」——不然不知道影响的是什么：{text}"
+        );
+    }
+
+    /// `command = ""` = 这一条关掉了。清单必须**说出来**，不能只是一片空白。
+    ///
+    /// 它是「为什么这个文件没反应」的两个答案之一（另一个是没装/不在 PATH）。
+    /// 留白的话，用户手上就只剩「我明明写了配置呀」这一个线索。
+    #[test]
+    fn an_empty_command_is_reported_as_switched_off() {
+        let config = config_with("", &["zz"]);
+        let text = lsp_status(&config, &[]);
+
+        assert!(text.contains("off"), "{text}");
+        // 关掉的条目**不该**顺带说一句「找不到」—— 那会把人往错的方向指
+        assert!(!text.contains("PATH"), "关掉不是「找不到」：{text}");
+    }
+
+    /// 「现在跑着几个」那一行：空的时候要说清**为什么**空。
+    ///
+    /// ⚠️ 空 ≠ 坏了：服务器是**用到了才起**的，而且只在真文件上起 ——
+    /// 停在目录列表里、或者这门语言的文件还没打开过，本来就该是空的。
+    /// 不说这句的话，「none」看起来就是「它没在工作」。
+    #[test]
+    fn an_empty_pool_says_none_but_explains_why() {
+        let text = lsp_status(&config_with("", &["zz"]), &[]);
+
+        assert!(text.contains("none"), "{text}");
+        assert!(
+            text.contains("opened"),
+            "要说清「不是坏了，是还没打开这种文件」：{text}"
+        );
+    }
+
+    /// 有会话在跑时，要把**命令**和**是哪个项目**都列出来。
+    #[test]
+    fn a_running_server_is_listed_with_its_project() {
+        let running = vec![
+            ("clangd".to_string(), "file:///D:/a".to_string()),
+            ("rust-analyzer".to_string(), "file:///D:/b".to_string()),
+        ];
+        let text = lsp_status(&config_with("", &["zz"]), &running);
+
+        assert!(text.contains("running now (2)"), "{text}");
+        assert!(text.contains("clangd"), "{text}");
+        assert!(text.contains("file:///D:/a"), "要说清是哪个项目：{text}");
+        assert!(text.contains("rust-analyzer"), "{text}");
+    }
+
+    /// ⚠️ 节名要**排过序**。`HashMap` 的遍历顺序是随机的 ——
+    /// 不排的话同一份配置每敲一次 `:lsp` 行序都不一样，
+    /// 而「行序莫名其妙在变」会让人以为自己改动了什么。
+    #[test]
+    fn the_lsp_list_is_sorted_and_never_changes_order() {
+        let config = config::Config::default();
+        let first = lsp_status(&config, &[]);
+        for _ in 0..20 {
+            assert_eq!(
+                lsp_status(&config, &[]),
+                first,
+                "同一份配置不该给出两种行序"
+            );
+        }
+
+        // 而且顺序**确实**是按名字来的（不是碰巧稳定）
+        let order: Vec<&str> = first
+            .lines()
+            .filter(|line| line.starts_with(['c', 'r']))
+            .collect();
+        assert_eq!(
+            order.first().map(|l| l.split_whitespace().next()),
+            Some(Some("c"))
         );
     }
 
@@ -1162,10 +1569,26 @@ mod tests {
         assert!(!is_current_file(&app, "file:///D:/proj/src/main.rs"));
     }
 
-    /// 虚拟视图（`:errors` 清单）也不是「那个文件」——
-    /// 它说的明明是同一个路径，但屏幕上那份文本**不是**它。
+    /// 虚拟视图（`:errors` / `:lsp` 清单）**照样认**那个文件 —— 但认的是
+    /// 「存下来」，不是「画出来」。
+    ///
+    /// ## 这条原来是反的，实测改的
+    ///
+    /// 旧版这里写的是「虚拟视图一律不认」，理由是「认了诊断就会画到清单上」。
+    /// 那个理由管的是**画**，而这一层管的是**存** —— 混在一起的代价是
+    /// 清单在屏幕上那段时间里到达的推送被**丢掉**，而且**不会再回来**
+    /// （服务器只在文本变了才推）。手动冒烟 A/B 对照实测：
+    ///
+    /// ```text
+    /// A：打开坏文件 → 等 → `:errors`          → 报出 1 条错误   ✅
+    /// B：打开坏文件 → `:lsp` → `q` → `:errors` → 「No problems」  ❌
+    /// ```
+    ///
+    /// 现在「画」由 `ui::line_number_colour` 单独守着（它遇到虚拟视图直接返回
+    /// 原色，测试 `the_error_list_does_not_colour_its_own_line_numbers`），
+    /// 所以这里收下来是安全的，而且从清单退回去时标记是**活的**。
     #[test]
-    fn a_virtual_view_is_never_the_file_a_diagnostic_is_about() {
+    fn a_virtual_view_still_keeps_the_file_behind_it() {
         let mut app = App::from_content(Some("D:\\proj\\src\\main.rs".to_string()), String::new());
         app.kind = DocumentKind::File;
         assert!(is_current_file(&app, "file:///D:/proj/src/main.rs"));
@@ -1173,10 +1596,12 @@ mod tests {
         app.show_list(DocumentKind::Errors, "1: error: x".to_string());
 
         assert!(
-            !is_current_file(&app, "file:///D:/proj/src/main.rs"),
-            "清单里那条路明明是同一个文件，但屏幕上是一份**我们生成的**清单 —— \
-             把它当成那个文件，诊断就会画到清单本身上"
+            is_current_file(&app, "file:///D:/proj/src/main.rs"),
+            "清单盖在上面时到达的推送必须**收下来** —— 丢掉就永远丢了，\
+             退回去会看到一个假的「干净」文件"
         );
+        // 但别的文件仍然不认（那才是「一堆不属于这份代码的红线」的来源）
+        assert!(!is_current_file(&app, "file:///D:/proj/src/lib.rs"));
     }
 
     /// ⚠️ **清单绝不能写回你的源码文件。**

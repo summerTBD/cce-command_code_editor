@@ -81,6 +81,14 @@ pub enum DocumentKind {
     Errors,
     /// `:ls` 的清单：打开过的文档，一行一个。同样是**我们生成的**只读视图。
     DocumentList,
+    /// `:lsp` 的清单：配了哪些语言服务器、它们的命令在不在 `PATH` 上、
+    /// 现在跑着几个。同样是**我们生成的**只读视图。
+    ///
+    /// 它和上面两种还不太一样：那两种的内容是**你本来就有的东西**
+    /// （文档列表、某个文件的毛病），而这一份是**程序自己的配置**。
+    /// 放进来是因为「一行装不下」这个理由一样 —— 而且它是你查
+    /// 「我明明装了怎么不动」时唯一能看的地方。
+    LspStatus,
 }
 
 impl DocumentKind {
@@ -94,7 +102,28 @@ impl DocumentKind {
     /// - 行号栏**不**染诊断色 —— 清单那几行的行号是诊断的行号，
     ///   再按诊断染色就是拿自己的输出喂自己
     pub fn is_virtual(self) -> bool {
-        matches!(self, Self::Errors | Self::DocumentList)
+        matches!(self, Self::Errors | Self::DocumentList | Self::LspStatus)
+    }
+
+    /// `file_path` 指的是**一个文件**吗（而不是一个目录）。
+    ///
+    /// ⚠️ 它和 [`DocumentKind::is_virtual`] **不是一回事**，两者是交叉的：
+    ///
+    /// | 种类 | `is_virtual` | `wraps_a_file` |
+    /// |------|--------------|----------------|
+    /// | `File` | ✗ | ✓ |
+    /// | `Errors` / `DocumentList` / `LspStatus` | ✓ 不能保存 | ✓ 盖在一个文件上 |
+    /// | `DirectoryListing` | ✓ 不能保存 | ✗ `file_path` 是个**目录** |
+    ///
+    /// 分成两个方法的理由：它们回答的是两个不同的问题。
+    /// 「能不能保存」「能不能发去语言服务器」问 `is_virtual`；
+    /// 「这条推送说的是不是我们现在打开的那个文件」问这个。
+    ///
+    /// 混着用的代价实测过：拿 `is_virtual` 去当后者，会顺手把
+    /// 「服务器在你看着清单时推来的诊断」一起丢掉，而且**永远丢**（见
+    /// `main::is_current_file` 的注释）。
+    pub fn wraps_a_file(self) -> bool {
+        !matches!(self, Self::DirectoryListing)
     }
 }
 
@@ -689,11 +718,15 @@ impl App {
             // `:errors` 的清单**继承**它来自的那个文件的目录 —— 这样你在清单里
             // 敲 `:open 文件名` 仍然找得到地方，而不是掉回进程的工作目录
             // （那个目录是隐形的，用户看不见它在哪）。
-            DocumentKind::File | DocumentKind::Errors | DocumentKind::DocumentList => {
-                Path::new(path)
-                    .parent()
-                    .map(|dir| dir.display().to_string())
-            }
+            //
+            // `:lsp` 那份清单也一样：它是从「你刚才在看的那个文件」那儿开的，
+            // 所以基准该是那个文件所在的目录。
+            DocumentKind::File
+            | DocumentKind::Errors
+            | DocumentKind::DocumentList
+            | DocumentKind::LspStatus => Path::new(path)
+                .parent()
+                .map(|dir| dir.display().to_string()),
         }
     }
 
@@ -866,8 +899,24 @@ impl App {
     /// ⚠️ 是**整体替换**，不是追加 —— 服务器每次推的都是「这个文件现在的
     /// *全部*问题」，追加的话**改好的错误永远擦不掉**。而这类 bug 最阴的地方在于
     /// 它表现为「什么都没发生」：你只会觉得工具坏了，不会想到是这里多了一行 `extend`。
+    ///
+    /// ## ⚠️ 快照里那份要**一起换**
+    ///
+    /// 屏幕上是一份清单（虚拟视图）时，[`App::restore_document`] 会把
+    /// 快照**整个**放回来，包括快照里的诊断。只换 `self.diagnostics` 的话，
+    /// 刚才那条推送会在你按 `q` 的那一刻被旧的盖回去 —— 于是表现成
+    /// 「诊断偶尔会消失」，而且只在「清单开着的时候服务器刚好推了东西」时出现。
+    ///
+    /// 只更新**同一个文件**的那份快照：从清单里 `:open` 去了别的文件再 `q` 回来时，
+    /// 快照说的正是要回去的那个文件，两边必须一致。
     pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
         self.diagnostics = diagnostics;
+
+        if let Some(saved) = self.saved.as_mut()
+            && saved.file_path == self.file_path
+        {
+            saved.diagnostics = self.diagnostics.clone();
+        }
     }
 
     /// 这一行上**最严重**的那条诊断（同一行有好几条时错误优先于警告）。
@@ -1507,6 +1556,68 @@ mod tests {
     }
 
     // ---------- 虚拟视图（`:errors`） ----------
+
+    /// ⚠️ **清单在屏幕上时到达的诊断，退回文件时必须还在。**
+    ///
+    /// 这条是手动冒烟测试 A/B 对照抓出来的（2026-09-15）：
+    ///
+    /// ```text
+    /// A：打开坏文件 → 等 → `:errors`          → 报出 1 条错误   ✅
+    /// B：打开坏文件 → `:lsp` → `q` → `:errors` → 「No problems」  ❌
+    /// ```
+    ///
+    /// 两处各错一半，合起来才凑成那个现象：
+    ///
+    /// 1. `main::is_current_file` 那时遇到虚拟视图一律不认 → 推送被**丢掉**；
+    /// 2. 就算收了，`restore_document` 又会把快照里那份**旧的**盖回来。
+    ///
+    /// 而且丢了就**永远丢了** —— 服务器只在文本变了才推，而文本一个字没动。
+    /// 于是症状是「诊断偶尔会消失」，只在「清单开着的时候服务器刚好推了东西」
+    /// 这一种时序下出现 —— 手动复现要靠运气，所以只能靠这条测试钉住。
+    #[test]
+    fn diagnostics_that_arrive_while_a_list_is_up_survive_going_back() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo".to_string());
+        assert!(app.diagnostics.is_empty(), "先得是干净的");
+
+        app.show_list(DocumentKind::Errors, "no problems".to_string());
+        // 清单在屏幕上的这段时间里，服务器推来了两条
+        app.set_diagnostics(vec![error_on(0), error_on(1)]);
+
+        assert!(app.restore_document());
+        assert_eq!(
+            app.diagnostics.len(),
+            2,
+            "退回去看到的是一个假的「干净」文件 —— 那份推送已经不会再来了"
+        );
+    }
+
+    /// 上面那条的另一半：**快照说的是别的文件时，不能被顺手改掉**。
+    ///
+    /// 回到的是 a.rs，所以行的标记必须还是 a.rs 那一条。
+    ///
+    /// ⚠️ 这个状态**从命令层到不了**：换文件走 `replace_document`，它会把快照
+    /// 整个清掉（那条路是刻意堵的 —— 见那里的注释）；而清单里 `:w` 又被拒。
+    /// 但 `App` 的公开接口（[`App::rename_document`]，另存为那条路）允许它，
+    /// 所以守卫得留着 —— 而这个守卫漏了的症状是「回到一个文件，看到的却是
+    /// 另一个文件的标记」，屏幕上两份东西都对，只有行号栏在说假话。
+    #[test]
+    fn a_snapshot_about_another_file_is_left_alone() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "a".to_string());
+        app.set_diagnostics(vec![error_on(0)]);
+        app.show_list(DocumentKind::Errors, "1: error: x".to_string());
+        // 快照是 a.rs 的，而「现在这个文件」改成了 b.rs
+        app.rename_document("b.rs".to_string());
+        // 这是 b.rs 的推送 —— 不该动「a.rs 那份快照」
+        app.set_diagnostics(vec![error_on(0), error_on(1), error_on(2)]);
+
+        assert!(app.restore_document());
+        assert_eq!(app.file_path.as_deref(), Some("a.rs"));
+        assert_eq!(
+            app.diagnostics.len(),
+            1,
+            "回到 a.rs，看到的该是 a.rs 的诊断"
+        );
+    }
 
     /// 进去再退出来，文档必须**一个字都没变** —— 包括光标、滚动、
     /// 撤销栈、以及那个「改过没保存」的标记。
