@@ -108,11 +108,17 @@ impl DocumentList {
         self.index
     }
 
-    /// 一行摘要，给 `:ls` 用。当前文档前面带 `*`，序号从 1 开始。
-    pub fn describe(&self) -> String {
-        if self.paths.is_empty() {
-            return "no documents".to_string();
-        }
+    /// 一份给人看的清单，**一行一个文档**（`:ls` 铺到屏幕上的就是它）。
+    ///
+    /// 当前文档前面带 `*`，序号从 1 开始。
+    ///
+    /// ⚠️ 为什么是「一行一个」而不是拼成一行：拼成一行会**从右边被切掉**，
+    /// 而且切得没有任何痕迹 —— 屏幕上剩一个看起来挺完整的开头，你会以为
+    /// 自己只打开了三个文件。Windows 路径本来就长，三四个就能撑爆一行。
+    ///
+    /// （以前就是拼一行的。改成清单视图之后 `describe` 那个名字也不合适了：
+    /// 「摘要」和「整份内容」是两件事。）
+    pub fn list_text(&self) -> String {
         self.paths
             .iter()
             .enumerate()
@@ -124,7 +130,7 @@ impl DocumentList {
                 }
             })
             .collect::<Vec<_>>()
-            .join("  ")
+            .join("\n")
     }
 }
 
@@ -236,15 +242,20 @@ mod tests {
         assert_eq!(list.len(), 1, "越界不该改动列表");
     }
 
+    /// 当前那一项带 `*`，而且**一行一个** —— 拼成一行的话，
+    /// 一个长路径就能把后面的全挤出屏幕，还看不出被挤掉了。
     #[test]
-    fn describe_marks_the_current_entry_with_a_star() {
+    fn the_list_text_marks_the_current_entry_with_a_star() {
         let mut list = list_of(&["a.txt", "b.txt"]);
         // remember 后停在最后一项
-        assert_eq!(list.describe(), "1 a.txt  2 *b.txt");
+        assert_eq!(list.list_text(), "1 a.txt\n2 *b.txt");
 
         list.remember("a.txt");
-        assert_eq!(list.describe(), "1 *a.txt  2 b.txt");
+        assert_eq!(list.list_text(), "1 *a.txt\n2 b.txt");
+    }
 
-        assert_eq!(DocumentList::new().describe(), "no documents");
+    #[test]
+    fn an_empty_list_has_empty_text() {
+        assert_eq!(DocumentList::new().list_text(), "");
     }
 }

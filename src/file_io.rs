@@ -13,7 +13,7 @@
 //! 依赖方向必须始终是 main → app，而不是反过来。
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 读取路径内容：文件读内容，目录列出直接子项。
 pub fn load_file_or_directory(path: &str) -> io::Result<String> {
@@ -72,6 +72,34 @@ pub fn full_path_in(base: Option<&str>, path: &str) -> String {
     }
 }
 
+/// 从 `start` 开始**往上**找含有 `marker` 的那个目录。
+///
+/// 语言服务器要一个「项目根」才知道去哪儿找 `Cargo.toml`。而用户打开的是
+/// `src/main.rs` —— 根还在上面两层。
+///
+/// ## 为什么用文件当标记，而不是目录名
+///
+/// 目录名是**用户起的**，可以是任何东西。而 `Cargo.toml` 是 Rust 项目
+/// **定义上的**标志 —— `cargo` 自己就是靠它往上找的。我们跟它用同一套判据，
+/// 就不会出现「我们的根和 cargo 的根不是同一个」这种事后很难查的怪事。
+///
+/// `start` 传文件也行：会先取它的父目录再往上走。
+pub fn find_upwards(start: &Path, marker: &str) -> Option<PathBuf> {
+    let mut dir = if start.is_dir() {
+        Some(start)
+    } else {
+        start.parent()
+    };
+    while let Some(current) = dir {
+        if current.join(marker).exists() {
+            return Some(current.to_path_buf());
+        }
+        // 到顶了（比如 `D:\` 的父目录）就自然是 None，循环随之结束
+        dir = current.parent();
+    }
+    None
+}
+
 /// 生成目录浏览内容。目录项按名称排序，子目录后附 `/` 便于区分。
 fn list_directory_entries(path: &str) -> io::Result<String> {
     let mut entries = std::fs::read_dir(path)?
@@ -89,6 +117,42 @@ fn list_directory_entries(path: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_upwards_walks_up_to_the_marker() {
+        // 这个仓库自己的根就有 Cargo.toml
+        let root = std::env::current_dir().expect("拿不到当前目录");
+        assert_eq!(
+            find_upwards(&root.join("src"), "Cargo.toml").as_deref(),
+            Some(root.as_path())
+        );
+        // 传**文件**也行：会先取父目录
+        assert_eq!(
+            find_upwards(&root.join("src").join("main.rs"), "Cargo.toml").as_deref(),
+            Some(root.as_path())
+        );
+    }
+
+    #[test]
+    fn find_upwards_returns_none_when_nothing_matches() {
+        let root = std::env::current_dir().expect("拿不到当前目录");
+        assert_eq!(find_upwards(&root, "绝不会有这种名字的文件.zzz"), None);
+    }
+
+    /// 有两层都放着标记时，要拿**最近**的那一个 ——
+    /// 「往上找」很容易写成「一直找到最上面」。
+    #[test]
+    fn find_upwards_takes_the_nearest_marker() {
+        let base = std::env::temp_dir().join(format!("stbd_find_{}", std::process::id()));
+        let inner = base.join("a").join("b");
+        std::fs::create_dir_all(&inner).expect("建临时目录失败");
+        std::fs::write(base.join("Cargo.toml"), "").unwrap();
+        std::fs::write(base.join("a").join("Cargo.toml"), "").unwrap();
+
+        assert_eq!(find_upwards(&inner, "Cargo.toml"), Some(base.join("a")));
+
+        std::fs::remove_dir_all(&base).expect("清临时目录失败");
+    }
 
     #[test]
     fn load_path_reads_file_content() {

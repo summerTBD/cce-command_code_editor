@@ -4,10 +4,19 @@
 //! 1. 解析命令行参数（可选的待打开文件路径）
 //! 2. 加载用户配置（config.rs；失败也不阻止启动）
 //! 3. 进入 raw mode + 备用屏（Alternate Screen）
-//! 4. 主循环：画(ui) → 读事件(event) → 分发(update) → 执行副作用(Action)
-//! 5. 无论如何退出都恢复终端
+//! 4. 把语言服务器接上（lsp/；起不来也不阻止启动）
+//! 5. 主循环：画(ui) → 读事件(event) → 分发(update) → 执行副作用(Action)
+//! 6. 无论如何退出都恢复终端
+//!
+//! ## 为什么这儿的每个自选功能都「坏了也不拦」
+//!
+//! 配置读不到、`cargo check` 起不来、`rust-analyzer` 找不到 —— 全都只写一句状态栏。
+//! 因为它们的共同点是：**它们都不是编辑器**。编辑器就是那个把文件和按键连起来的
+//! 东西，它必须永远能用。把「锦上添花」和「基本盘」的失败分开处理，
+//! 是 `run_action` 不抛错误、`start_check` 不抛错误、`start_lsp` 也不抛错误的同一个理由。
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -24,6 +33,10 @@ use ratatui::backend::CrosstermBackend;
 
 use stbd::app::{App, DocumentKind};
 use stbd::commands::Action;
+use stbd::lsp;
+use stbd::lsp::pool::Pool;
+use stbd::lsp::session::{Outcome, Session};
+use stbd::outbox::{OutFile, Outbox};
 use stbd::update;
 use stbd::{check, config, event, file_io, ui};
 
@@ -34,6 +47,14 @@ type Term = Terminal<Backend>;
 fn main() -> io::Result<()> {
     // 1. 读取命令行传入的文件（没传就开一个新文件）
     let (file_path, content) = load_file_from_args();
+
+    // 1.5 把输出文件夹清一遍。
+    //
+    // 为什么**进入**也要清：上一次那个程序可能是**崩掉**的，没走到退出那一步，
+    // 于是 `file_list.txt` 里还留着上一次的内容 —— 而它看起来跟这一次的一模一样，
+    // 你会拿着上次的列表当这次的用。「进入和退出各清一次」听起来像重复，
+    // 实际上清的分别是「上一次失败留下的」和「这一次留下的」。
+    Outbox::locate().clean();
 
     // 2. 读用户配置：找不到文件就用默认值；文件写错了也不致命，只记下提示
     //    （配置文件是锦上添花的东西，绝不该让编辑器打不开）
@@ -72,6 +93,14 @@ fn main() -> io::Result<()> {
     // 5. 主循环；结束后把终端还给用户
     let result = run_event_loop(&mut terminal, &mut app);
     release_terminal()?;
+
+    // 6. 把输出文件夹清一遍再走。
+    //
+    // ⚠️ 进入时（在 `main` 开头那一次）也清一遍，不是重复：
+    //    上一次的程序可能是**崩掉**的，根本没走到这里 —— 只清退出的话，
+    //    下次打开会看见上一次的残留，而它看起来跟这一次的一模一样。
+    Outbox::locate().clean();
+
     result
 }
 
@@ -113,12 +142,34 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
     // 理由见 `App::checking` 的注释：App 只记「有没有」，不持有通道。
     let mut check: Option<mpsc::Receiver<check::CheckReport>> = None;
 
+    // 语言服务器。跟 `check` 完全同一个立场：它是**活的东西**（一个进程、
+    // 两根管道、两个线程），所以住在主循环里，不进 `App`。
+    // `App` 只拿它的**产出**（`app.diagnostics`），那才是纯数据。
+    //
+    // ⚠️ 池子一开始是**空的**：会话用到了才起。所以你只在一个项目里干活时，
+    //    上限写 1 和写 8 完全一样（都只有一个进程）。
+    let mut lsp = Pool::new(app.config.lsp_max_servers);
+
     // 先画一帧。新循环不再「每轮开头都画」，所以启动这一帧得自己补上，
     // 否则打开编辑器会看到一片空白 —— 直到你按第一个键。
     terminal.draw(|frame| ui::render_ui(frame, app))?;
 
+    // 开机先报一次事实。
+    //
+    // ⚠️ 不能省：下面那个同步是挂在「这一轮手上有动作」上的，不补这一次的话，
+    //    打开一个文件、什么都不按，语言服务器就永远不会起来 ——
+    //    看起来就像「它只在我开始打字之后才睡醒」。
+    sync_document(&mut lsp, app);
+
     loop {
         let mut redraw = false;
+        // 这一轮手上动了东西吗（键盘 / 鼠标 / 粘贴）。
+        //
+        // ⚠️ 拿它当「要不要去同步文档」的开关，是为了**别在闲着的时候干活**：
+        //    比文本要先把它整份拷出来（O(文件大小)），而屏幕上的字只可能
+        //    因为这几类事件改变 —— 没人按键的 50ms 里，它不可能变。
+        //    没有这个开关的话，一个空转的编辑器也会每秒白白拷 20 次文件。
+        let mut touched = false;
 
         // 最多等 TICK。返回 `None` = 键盘没动静，但**不等于没事可做**：
         // 下面照样会去看后台消息。
@@ -126,12 +177,24 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
             redraw = true;
             match ev {
                 event::Event::Key(key) => {
+                    touched = true;
                     // update 只处理按键；把文本区估算尺寸传进去用于自动滚动
                     let (view_h, view_w) = compute_view_size(app);
                     // 一个按键可能产出多个动作（命令模式的 `&&` 链），按顺序执行
                     for action in update::handle_key_event(app, key, view_h, view_w) {
                         match run_action(app, action) {
-                            Step::Quit => return Ok(()),
+                            Step::Quit => {
+                                // 提前把所有服务器收掉：`shutdown` 可能要等每个最多
+                                // 200ms，放在这里等于**在备用屏里等** —— 用户看到的是
+                                // 「按 q 到回 shell」之间那点空白，而不是回到 shell 后
+                                // 干等一个提示符。
+                                //
+                                // ⚠️ 写成显式 `drop` 而不是让它自然离开作用域：
+                                //    这一步是**有代价**的（真的在杀进程、等它走），
+                                //    值得让读者看见它在这里发生。
+                                drop(lsp);
+                                return Ok(());
+                            }
                             // 让位：终端暂时交出去，回来之后界面还是原样
                             Step::HandOver(line) => run_external_command(terminal, app, &line),
                             Step::StartCheck => check = start_check(app),
@@ -140,6 +203,7 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
                     }
                 }
                 event::Event::Mouse(mouse) => {
+                    touched = true;
                     let (view_h, view_w) = compute_view_size(app);
                     update::handle_mouse_event(app, mouse, view_h, view_w);
                 }
@@ -147,12 +211,22 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
                 event::Event::Resize(..) => {}
                 // 粘贴：bracketed paste 已把整段文本聚合成一个事件，交给 update 分发
                 event::Event::Paste(text) => {
+                    touched = true;
                     let (view_h, view_w) = compute_view_size(app);
                     update::handle_paste_event(app, &text, view_h, view_w);
                 }
                 event::Event::Ignored => {}
             }
         }
+
+        // 屏幕上的东西可能变了 → 告诉服务器现在是什么样。
+        // 要不要真的开口由会话自己判断（一个字没动就什么都不发）。
+        if touched {
+            sync_document(&mut lsp, app);
+        }
+
+        // 收服务器这一轮说的话（非阻塞，没话说就立刻回来）
+        drain_lsp(&mut lsp, app, &mut redraw);
 
         // 把后台攒下的消息**一口气全取走**。
         //
@@ -208,6 +282,156 @@ fn start_check(app: &mut App) -> Option<mpsc::Receiver<check::CheckReport>> {
             None
         }
     }
+}
+
+// ---------- 语言服务器 ----------
+
+/// 我们要起的那个服务器。以后要支持别的语言，就从这里长出一个配置项。
+const LSP_COMMAND: &str = "rust-analyzer";
+
+/// 给它的命令行参数。
+///
+/// ⚠️ 空数组是**故意的**：`rust-analyzer` 不带参数时走的就是 stdio（我们唯一
+/// 支持的那条路）。网上到处能看到 `--stdio`，那是别的编辑器为了**明确要求**
+/// 它别去猜别的传输方式 —— 而在最新版里它已经是个不认得的参数了。
+/// 写上去只会让它启动失败，而失败的样子是「诊断一条都没有」，很难查。
+const LSP_ARGS: &[&str] = &[];
+
+/// 拿这个文件去找它的**项目根**。
+///
+/// 服务器要的是根，不是当前这个文件 —— 我们打开的是 `src/main.rs`，
+/// 根还在上面两层。用 `Cargo.toml` 当标记：`cargo` 自己就是靠它往上找的，
+/// 我们跟它用同一套判据，才不会出现「我们的根和 cargo 的根不是同一个」
+/// 这种事后极难查的怪事。
+///
+/// ⚠️ **每次都要重新算，不能只在启动时算一次。**
+///
+/// 这是这个功能里最容易做错、又最难发现的一处。第一版就是启动时算了一次，
+/// 于是 `:open ..\另一个项目\src\main.rs` 之后：那个文件不属于启动时那个根，
+/// 服务器对它一个字都不说（实测 45 秒 0 份推送），而屏幕上什么都不显示 ——
+/// 看起来就像「这个文件恰好没问题」。
+///
+/// 找不到根（不是一个 Cargo 项目）时返回 `None`。这是**正常**情况：拿它编辑
+/// 一个单独的 `.txt`，凭什么要求它是个 Rust 项目。所以这里不报错、不提示。
+fn project_root_of(path: &str) -> Option<PathBuf> {
+    file_io::find_upwards(Path::new(path), "Cargo.toml")
+}
+
+/// 报告事实：**现在屏幕上是这个文件、这些文本**。
+///
+/// 这里干三件事，顺序不能乱：
+/// 1. 把上限从配置同步给池子（`:set` / `:config reload` 改的都算数）
+/// 2. 算出这个文件属于哪个项目根，拿到那个根的会话（没有就起一个）
+/// 3. 把「现在是什么」告诉它
+///
+/// 要不要真的发消息，由 [`Session::show`] 自己判断（一个字没变就什么都不发）。
+fn sync_document(pool: &mut Pool, app: &mut App) {
+    // 上限**每轮都同步一次**，而不是启动时读一次。
+    //
+    // 这样 `:set lspmaxservers 1` 和 `:config reload` 都自动生效，不需要
+    // 任何一处额外的接线 —— 也就是说，不可能出现「改了设置但那条路忘了通知池子」。
+    pool.set_limit(app.config.lsp_max_servers);
+
+    // 0 = 用户把语言服务器整个关掉了。**在这里就停住**，不去打扰池子 ——
+    // 池子的「上限 0」守卫是防死循环用的（见 `Pool::acquire`），
+    // 不是拿来说给用户听的。
+    if app.config.lsp_max_servers == 0 {
+        return;
+    }
+
+    // ⚠️ **只有真文件才同步。**
+    //
+    // 目录列表不是源代码。更要紧的是以后那个 `:errors` 视图 —— 它是一份
+    // **我们生成的**文本，要是也发过去，服务器会认认真真地给你报
+    // 「这一堆字里有语法错误」，然后那些错又会显示在屏幕上。
+    if app.kind != DocumentKind::File {
+        return;
+    }
+    let Some(path) = app.file_path.clone() else {
+        return;
+    };
+    let Some(root) = project_root_of(&path) else {
+        return;
+    };
+    let Some(uri) = lsp::uri::path_to_uri(Path::new(&path)) else {
+        return;
+    };
+    let Some(root_uri) = lsp::uri::path_to_uri(&root) else {
+        return;
+    };
+
+    let text = app.buffer.to_string();
+    let language = lsp::session::language_id(&path);
+
+    // 先拿到会话，再说话 —— 分两步是因为 `acquire` 要可变借池子，
+    // 而 `show` 要可变借那个会话，同一个表达式里做不到
+    let outcome = match pool.acquire(&root_uri, || {
+        Session::start(LSP_COMMAND, LSP_ARGS, Some(root.as_path()), Some(&root_uri))
+    }) {
+        Ok(session) => session.show(&uri, language, &text).err(),
+        // 起不来。⚠️ 同一个根**只报一次** —— 这句话每按一个键就刷一遍的话，
+        // 会把 `:w` 那句「Saved foo.rs」冲掉，用户就看不见自己保存成功了
+        Err(failure) if !failure.already_reported => {
+            app.set_status_message(format!("LSP: {}", failure.reason));
+            None
+        }
+        Err(_) => None,
+    };
+
+    if let Some(err) = outcome {
+        // 写不进去基本就是「它已经死了」。真正的收摊在 `drain_lsp` 里 ——
+        // 那边的 `Broken` 才是准信，这里只把这一轮的写失败说出来。
+        app.set_status_message(format!("LSP: {err}"));
+    }
+}
+
+/// 收所有服务器这一轮说的话。
+///
+/// `redraw` 会被改成 `true`：诊断来了行号栏的颜色就变了，必须重画 ——
+/// 否则新颜色要等你下次按键才出现，看起来就像「它反应很慢」。
+fn drain_lsp(pool: &mut Pool, app: &mut App, redraw: &mut bool) {
+    for (_root_uri, outcome) in pool.poll_all() {
+        match outcome {
+            // 握上手了。说一句，**只一次**（每个会话各说一次）——
+            // 不然「这个文件没问题」和「服务器根本没连上」在屏幕上长得一模一样。
+            Outcome::Ready => app.set_status_message("LSP: rust-analyzer is ready"),
+            Outcome::Diagnostics(push) => {
+                // 它也会报**别的文件**（我们刚关掉的那个、`build.rs`……），
+                // 而且不同的根还会各报各的。只认现在屏幕上这个 ——
+                // 不然你会看到一堆不属于这份代码的红线。
+                if !is_current_file(app, &push.uri) {
+                    continue;
+                }
+                // 空的那份也照样换上去：那是「这个文件现在没毛病」，
+                // 不换的话改好的错误会永远留在行号栏上。
+                app.set_diagnostics(push.diagnostics);
+                *redraw = true;
+            }
+            // 线断了。不需要在这里做什么收摊 —— `Pool::poll_all` 已经把它
+            // 从池子里摘掉了（`drop` 顺带收尸），我们只负责说一句。
+            Outcome::Broken(why) => app.set_status_message(format!("LSP: {why}")),
+        }
+    }
+}
+
+/// 这条诊断推送说的是**现在屏幕上的那个文件**吗。
+///
+/// ⚠️ 用 [`lsp::uri::same_file`] 比，**不能比字符串**：我们发出去的是
+/// `file:///D:/...`，它回来的是 `file:///d:/...`（实测），字符串相等永远是假
+/// —— 于是表现成「诊断一条都不显示」，而服务器那头一切正常，两头都看不出毛病。
+///
+/// 单独拆成函数是为了能直接测：它判错的后果（诊断全丢）在界面上看不出来。
+fn is_current_file(app: &App, uri: &str) -> bool {
+    if app.kind != DocumentKind::File {
+        return false;
+    }
+    let Some(path) = app.file_path.as_deref() else {
+        return false;
+    };
+    let Some(current) = lsp::uri::path_to_uri(Path::new(path)) else {
+        return false;
+    };
+    lsp::uri::same_file(&current, uri)
 }
 
 /// 估算「文本区」能显示的行/列数，供 update 里的自动滚动使用。
@@ -305,8 +529,32 @@ fn run_action(app: &mut App, action: Action) -> Step {
         Action::RunExternal(line) => return Step::HandOver(line),
         // 需要起线程 / 留通道，同样交回主循环
         Action::RunCheck => return Step::StartCheck,
+        // 纯状态：把虚拟视图退掉，原来那份文档原样放回来（不需要读盘）
+        Action::RestoreDocument => {
+            if !app.restore_document() {
+                // 几乎不可能：按 `q` 的前提就是「正处在虚拟视图里」。
+                // 真到了这儿也只能说一句，不该抛错更不该退出。
+                app.set_status_message("Nothing to go back to");
+            }
+        }
+        // 把屏幕上那份清单抄进输出文件夹
+        Action::WriteOutbox(file) => write_outbox(app, file),
     }
     Step::Continue
+}
+
+/// 把**屏幕上那份清单**抄进输出文件夹。
+///
+/// ⚠️ 抄的是 `app.buffer`，不是重新算一遍 —— 屏幕上显示的就是 `app.buffer`，
+/// 两个来源的话迟早会出现「文件里有、屏幕上没有」这种对不上的情况。
+///
+/// 失败只说一句：屏幕上那份清单照样在，而输出文件夹只是一个方便。
+/// （跟「配置文件读不到就全用默认值」一个立场：锦上添花的东西不该拦住基本盘。）
+fn write_outbox(app: &mut App, file: OutFile) {
+    let text = app.buffer.to_string();
+    if let Err(err) = Outbox::locate().write(file, &text) {
+        app.set_status_message(format!("Cannot write {} ({err})", file.name()));
+    }
 }
 
 /// 把编辑器要的终端状态装回去（[`release_terminal`] 的逆操作），
@@ -855,5 +1103,123 @@ mod tests {
         let stored = app.file_path.clone().expect("应该打开成功");
         assert!(stored.ends_with("main.rs"), "{stored}");
         assert!(stored.contains("src"), "应该落在 src 里：{stored}");
+    }
+
+    // ---------- 语言服务器的判断 ----------
+
+    /// ⚠️ **大小写不同的盘符是同一个文件。**
+    ///
+    /// 实测：我们发出去的是 `file:///D:/...`，服务器回来的是 `file:///d:/...`。
+    /// 拿字符串相等去比，这条判断**永远是假** —— 表现成「诊断一条都不显示」，
+    /// 而服务器那头一切正常。两头都看不出毛病，只能靠这条测试钉住。
+    /// ⚠️ 同一个根反复失败只报一次 —— 不然每按一个键就把「Saved x.rs」盖掉
+    ///
+    /// （下面这几条测的是 `is_current_file`，它守着「这条推送是不是说现在
+    ///   屏幕上这个文件的」。虚拟视图那一条跟它同时管着「清单不会被当成源码发出去」。）
+    #[test]
+    fn a_push_about_the_same_file_in_a_different_case_still_matches() {
+        let mut app = App::from_content(Some("D:\\proj\\src\\main.rs".to_string()), String::new());
+        app.kind = DocumentKind::File;
+
+        assert!(
+            is_current_file(&app, "file:///d:/proj/src/main.rs"),
+            "服务器把盘符规范化成小写了，我们却认不出来 —— 诊断会全丢"
+        );
+        assert!(
+            is_current_file(&app, "file:///D:/proj/src/main.rs"),
+            "原样的盘符当然也得认"
+        );
+    }
+
+    /// 别的文件的诊断**不能**显示在当前文件上。
+    #[test]
+    fn a_push_about_another_file_is_refused() {
+        let mut app = App::from_content(Some("D:\\proj\\src\\main.rs".to_string()), String::new());
+        app.kind = DocumentKind::File;
+
+        assert!(!is_current_file(&app, "file:///D:/proj/src/lib.rs"));
+        assert!(!is_current_file(&app, "file:///D:/proj/src/main.rs.bak"));
+    }
+
+    /// ⚠️ **不是普通文件（目录列表、`:errors` 清单）一律不认。**
+    ///
+    /// 认了的后果很具体：那是一份**我们生成的**文本，服务器会认认真真地
+    /// 给它报「这一堆字里有语法错误」，而那些错又会显示在屏幕上 ——
+    /// 一个自己造出来的错误。
+    #[test]
+    fn a_listing_is_never_the_file_a_diagnostic_is_about() {
+        let mut app = App::from_content(Some("D:\\proj".to_string()), String::new());
+        app.kind = DocumentKind::DirectoryListing;
+
+        assert!(!is_current_file(&app, "file:///D:/proj"));
+        assert!(!is_current_file(&app, "file:///D:/proj/main.rs"));
+    }
+
+    /// 还没打开任何文件 → 谁的诊断都不是。
+    #[test]
+    fn with_no_file_open_nothing_matches() {
+        let app = App::new();
+        assert!(!is_current_file(&app, "file:///D:/proj/src/main.rs"));
+    }
+
+    /// 虚拟视图（`:errors` 清单）也不是「那个文件」——
+    /// 它说的明明是同一个路径，但屏幕上那份文本**不是**它。
+    #[test]
+    fn a_virtual_view_is_never_the_file_a_diagnostic_is_about() {
+        let mut app = App::from_content(Some("D:\\proj\\src\\main.rs".to_string()), String::new());
+        app.kind = DocumentKind::File;
+        assert!(is_current_file(&app, "file:///D:/proj/src/main.rs"));
+
+        app.show_list(DocumentKind::Errors, "1: error: x".to_string());
+
+        assert!(
+            !is_current_file(&app, "file:///D:/proj/src/main.rs"),
+            "清单里那条路明明是同一个文件，但屏幕上是一份**我们生成的**清单 —— \
+             把它当成那个文件，诊断就会画到清单本身上"
+        );
+    }
+
+    /// ⚠️ **清单绝不能写回你的源码文件。**
+    ///
+    /// `:w` 落地成 [`Action::Save`] 之后由 `run_action` 执行，所以这一条
+    /// 只能在 main 这一层测 —— 命令层只管产出动作。
+    #[test]
+    fn saving_is_refused_while_the_error_list_is_on_screen() {
+        let mut app = App::from_content(Some("target.rs".to_string()), "code".to_string());
+        app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
+
+        run_action(&mut app, Action::Save);
+
+        assert!(
+            app.status_message.starts_with("Cannot save"),
+            "该明确拦下来：{}",
+            app.status_message
+        );
+    }
+
+    /// ⚠️ 退出虚拟视图走的是「**原样放回**」，不是「重新打开」。
+    ///
+    /// 这条只能在 main 这一层测：命令层和按键层都只**产出**动作，
+    /// 真正把它执行掉的是这里。
+    ///
+    /// 两件事都不能错：
+    /// - 走 `OpenPath` 的话会重新读盘 —— **丢掉没保存的改动**；
+    /// - 而且那条路上还拦着「没保存不许走」，于是你会被堵在清单里出不来 ——
+    ///   而那恰好是「刚改完代码、想看还剩什么错」的时刻。
+    #[test]
+    fn leaving_a_list_puts_the_document_back_untouched() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo".to_string());
+        // 改一下，把「未保存」这个状态摆上
+        app.set_mode(stbd::app::EditorMode::Edit);
+        app.cursor = stbd::app::Cursor { row: 0, col: 3 };
+        app.insert_char_at_cursor('!');
+        assert!(app.dirty);
+        app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
+
+        run_action(&mut app, Action::RestoreDocument);
+
+        assert_eq!(app.kind, DocumentKind::File);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("one!"));
+        assert!(app.dirty, "「改过没保存」不能丢 —— 丢了 `:q` 就不再拦你");
     }
 }

@@ -60,7 +60,11 @@ pub(crate) struct Snapshot {
 }
 
 /// 撤销 / 重做栈。
-#[derive(Debug)]
+///
+/// `Clone` 不是随手加的：`App` 进虚拟视图（`:errors`）时要把整个文档状态
+/// 存一份快照、退出来再放回去。里面的快照本身都是 O(1) 的（rope + `Arc`），
+/// 所以这一份克隆是**几个指针**，不是几份文本。
+#[derive(Debug, Clone)]
 pub(crate) struct UndoStack {
     /// 已发生的编辑（每步保存「执行前」的状态）
     undo: VecDeque<Snapshot>,

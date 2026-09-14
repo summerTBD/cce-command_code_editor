@@ -43,8 +43,9 @@
 //! （变量、通配、命令替换），而这里根本没有展开 —— 搬过来就只是白拿复杂度。
 //! 详细理由写在 [`lex`] 的文档上。
 
-use crate::app::{App, EditorMode};
+use crate::app::{App, DocumentKind, EditorMode};
 use crate::config::Config;
+use crate::outbox::OutFile;
 
 /// **update**（按键或命令）要 main.rs 去做的「副作用」。
 ///
@@ -93,6 +94,18 @@ pub enum Action {
     /// 等你敲回车；这个一个字都不往终端写，你继续编辑，结果到了才报。
     /// main 负责：起线程 + 留一个收件通道（见 `check::spawn`）。
     RunCheck,
+    /// 从虚拟视图（`:errors`）退回原来那份文档。
+    ///
+    /// ⚠️ 它**不是** [`Action::OpenPath`] —— 那个会去磁盘上重新读一遍，
+    /// 而重新读盘会丢掉没保存的改动（而且 `q` 那条路上还拦着「没保存不许走」，
+    /// 于是你会被堵在清单里出不来）。清单只是换了个东西给你看，
+    /// 退出时该把原来那份**原样放回来**。
+    RestoreDocument,
+    /// 把**现在屏幕上那份清单**抄进输出文件夹里的那个文件。
+    ///
+    /// 只带「往哪个文件写」—— **不带正文**。正文就是 `App` 里那个缓冲区，
+    /// main 抄它就行。带上正文等于把同一份东西存两处，两边迟早对不上。
+    WriteOutbox(OutFile),
 }
 
 // ===== 命令表 =====
@@ -105,6 +118,7 @@ const NEXT_USAGE: &str = "Usage: next [--force]";
 const LS_USAGE: &str = "Usage: ls";
 const FORGET_USAGE: &str = "Usage: forget <n>  (n comes from :ls)";
 const CHECK_USAGE: &str = "Usage: check";
+const ERRORS_USAGE: &str = "Usage: errors";
 const OPEN_USAGE: &str = "Usage: open <path> [--force]";
 const WRITE_USAGE: &str = "Usage: write [<path>]";
 const WQ_USAGE: &str = "Usage: wq";
@@ -118,7 +132,7 @@ const SWAP_USAGE: &str = "Usage: swap <line x> <line y>  (both 1-based)";
 const INSERT_USAGE: &str = "Usage: insert";
 const UNDO_USAGE: &str = "Usage: undo";
 const REDO_USAGE: &str = "Usage: redo";
-const SET_USAGE: &str = "Usage: set number | set nonumber | set tabwidth <n> | set scrolloff <n> | set sidescrolloff <n>";
+const SET_USAGE: &str = "Usage: set number | set nonumber | set tabwidth <n> | set scrolloff <n> | set sidescrolloff <n> | set lspmaxservers <n>";
 
 /// 一条命令的静态描述。
 ///
@@ -214,8 +228,20 @@ const COMMANDS: &[Spec] = &[
         name: "check",
         // 故意**不给** `:c` 别名：vim 里 `:c` 是 quickfix 那一族，
         // 以后要加 `:errors` / 跳错误的命令时那个字母还会用到。
+        //
+        // （现在 `:errors` 加进来了，它也没有别名 —— vim 里 `:e` 是 `:edit`。）
         aliases: &[],
         usage: CHECK_USAGE,
+        force: false,
+    },
+    // ---- 诊断 ----
+    Spec {
+        name: "errors",
+        // ⚠️ `force: false` —— 它**能**顶掉当前屏幕上的东西，但不该要 `--force`：
+        //    那份文档会被原样存下来，退出时一个字不差地放回去（见 `Action::RestoreDocument`）。
+        //    「这个命令会弄丢什么吗」才是 `--force` 存在的理由，而它不丢东西。
+        aliases: &[],
+        usage: ERRORS_USAGE,
         force: false,
     },
     // ---- 编辑 ----
@@ -621,8 +647,8 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         ("back", []) => go_back(app, force),
         ("next", []) => go_next(app, force),
         ("ls", []) => {
-            app.set_status_message(format!("Documents: {}", app.documents.describe()));
-            Ok(None)
+            let shown = list_documents(app);
+            Ok(shown.then_some(Action::WriteOutbox(OutFile::FileList)))
         }
         ("forget", [n]) => {
             forget_document(app, n)?;
@@ -725,10 +751,76 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             set_side_scroll_margin(app, n)?;
             Ok(None)
         }
+        ("set", ["lspmaxservers", n]) => {
+            set_lsp_max_servers(app, n)?;
+            Ok(None)
+        }
+
+        // ---- 诊断 ----
+        ("errors", []) => {
+            let shown = open_error_list(app);
+            Ok(shown.then_some(Action::WriteOutbox(OutFile::ErrorLog)))
+        }
 
         // 名字认得，但这组位置参数不是它接受的样子（少写了 / 多写了 / 子命令拼错了）
         _ => Err(spec.usage.to_string()),
     }
+}
+
+// ---------- 长输出：铺成一屏，还是写一行 ----------
+//
+// 有几条命令的输出**装不下一行**。它们和一个「一行状态栏」是两种东西：
+//
+//   一行状态栏   —— 一句话的回执（`:w` 说 Saved、`:check` 说跑完了）
+//   一屏清单      —— 一份**内容**（有几个文档、这个文件有哪些毛病）
+//
+// 判断标准没法自动定，所以**在这里明说**：下面这几条走清单，其余全走状态栏。
+//
+//   `:ls`     → file_list.txt
+//   `:errors` → error_log.txt
+//
+// 都从 [`open_list`] 出去 —— 一处定义，就不会出现「这条铺一屏、那条挤一行」
+// 这种要靠记忆去维持的不一致。
+//
+// 清单除了铺到屏幕上，还会**落成文件**（见 `outbox.rs`）—— 长输出不该只活在
+// 内存里，那样你想拿它去搜、去比对的时候就没辙了。
+//
+// ⚠️ 清单是**快照**：铺上去之后就不管了。诊断变了、文档列表变了，它自己不动 ——
+//    想看新的就再敲一次那条命令。这样「屏幕上这份东西是什么时候的」永远是确定的。
+
+/// 把一份清单铺到屏幕上，返回**是否真的铺了**。
+///
+/// ⚠️ 那个返回值不是装饰：调用方靠它决定要不要 `Action::WriteOutbox`。
+/// 没铺却去写的话，写进去的是**上一份内容**（或者当前那份文档的正文）——
+///  于是 `file_list.txt` 里躺着你正在编辑的代码，而下一次 `:ls` 之前它一直躺在那儿。
+fn open_list(app: &mut App, kind: DocumentKind, content: String, empty_message: &str) -> bool {
+    if content.is_empty() {
+        app.set_status_message(empty_message.to_string());
+        return false;
+    }
+    app.show_list(kind, content);
+    true
+}
+
+/// `errors`：把当前文件现在的毛病列成一份只读清单。返回是否铺了。
+fn open_error_list(app: &mut App) -> bool {
+    open_list(
+        app,
+        DocumentKind::Errors,
+        crate::diagnostic::list_text(&app.diagnostics),
+        // 空清单不值得占一屏 —— 而且它会让人以为自己改好了
+        "No problems in this file",
+    )
+}
+
+/// `ls`：把打开过的文档列成一份只读清单。返回是否铺了。
+fn list_documents(app: &mut App) -> bool {
+    open_list(
+        app,
+        DocumentKind::DocumentList,
+        app.documents.list_text(),
+        "No documents opened yet",
+    )
 }
 
 /// 「命令不认识」时给用户的话。
@@ -806,6 +898,12 @@ pub(crate) fn blocked_by_unsaved_changes(app: &mut App) -> bool {
 /// 已经在第一个也算**失败** —— 「该做的事没做成」。所以 `back && ls` 在头一条文档上
 /// 不会去执行 `ls`，`back && back` 也会在退无可退时自然停下。
 fn go_back(app: &App, force: bool) -> Executed {
+    // ⚠️ 虚拟视图（`:errors`）不在文档列表里 —— 它的「上一级」就是**进它之前
+    //    那份文档**，而且是原样放回来，不是重新读盘。
+    //    所以这条路上**不检查未保存改动**：什么都没丢，没什么要拦的。
+    if app.kind.is_virtual() {
+        return Ok(Some(Action::RestoreDocument));
+    }
     let Some(previous) = app.documents.previous_path() else {
         return Err("Already at the first document".to_string());
     };
@@ -1054,6 +1152,29 @@ fn set_side_scroll_margin(app: &mut App, value_text: &str) -> Result<(), String>
             Ok(())
         }
         _ => Err("Invalid side scroll margin: use a number from 0 to 100".to_string()),
+    }
+}
+
+/// `set lspmaxservers N`：设置最多同时保留几个语言服务器（`0` = 不开）。
+///
+/// ⚠️ 这里**只改那个数字**，不自己动手去踢服务器 —— 「多出来的那些当场收掉」
+/// 是主循环的会话池在下一次同步时读到新数字之后干的。两边各管一件事：
+/// 命令层只会改设置，进程的生死全归池子，就不会出现「两个地方都在杀进程」。
+fn set_lsp_max_servers(app: &mut App, value_text: &str) -> Result<(), String> {
+    match value_text.parse::<usize>() {
+        // 上限跟 config.rs 里的 `MAX_LSP_MAX_SERVERS` 对齐；这儿再写一遍是因为
+        // 这条命令面对的是「刚敲进去的一个数」，得能当场说清楚范围
+        Ok(new_limit) if new_limit <= 8 => {
+            app.config.lsp_max_servers = new_limit;
+            let message = if new_limit == 0 {
+                "Language servers off".to_string()
+            } else {
+                format!("Language servers limited to {new_limit}")
+            };
+            app.set_status_message(message);
+            Ok(())
+        }
+        _ => Err("Invalid language server count: use a number from 0 to 8".to_string()),
     }
 }
 
@@ -1357,6 +1478,8 @@ mod tests {
             "set tabwidth 4",
             "set scrolloff 1",
             "set sidescrolloff 1",
+            "set lspmaxservers 1",
+            "errors",
         ];
 
         for spec in COMMANDS {
@@ -1753,5 +1876,175 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    // ---------- errors ----------
+
+    fn app_with_diagnostics() -> App {
+        let mut app = app_with("one\ntwo\nthree");
+        app.set_diagnostics(vec![
+            crate::diagnostic::Diagnostic {
+                line: 2,
+                severity: crate::diagnostic::Severity::Error,
+                message: "boom".to_string(),
+            },
+            crate::diagnostic::Diagnostic {
+                line: 0,
+                severity: crate::diagnostic::Severity::Warning,
+                message: "meh".to_string(),
+            },
+        ]);
+        app
+    }
+
+    #[test]
+    fn errors_opens_a_read_only_list_of_the_problems() {
+        let mut app = app_with_diagnostics();
+
+        // 铺完还要**落成文件** —— 长输出不该只活在内存里
+        assert_eq!(
+            run(&mut app, "errors"),
+            Some(Action::WriteOutbox(OutFile::ErrorLog))
+        );
+
+        assert_eq!(app.kind, crate::app::DocumentKind::Errors);
+        // 按行号排好、一条一行
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("1: warning: meh"));
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("3: error: boom"));
+    }
+
+    /// `:ls` 铺一屏之后**也要落成文件**。
+    #[test]
+    fn ls_puts_the_list_on_screen_and_writes_it_out() {
+        let mut app = app_with("one");
+        app.documents.remember("a.txt");
+
+        assert_eq!(
+            run(&mut app, "ls"),
+            Some(Action::WriteOutbox(OutFile::FileList))
+        );
+
+        assert_eq!(app.kind, crate::app::DocumentKind::DocumentList);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("1 *a.txt"));
+    }
+
+    /// ⚠️ 没东西可列时**不能**产出写入动作。
+    ///
+    /// 产出了的话，main 会把 `app.buffer` 抄进那个文件 —— 而这时候缓冲区里
+    /// 是**你正在编辑的那份文档**。于是 `file_list.txt` 里躺着你的代码，
+    /// 而且在下一次 `:ls` 之前它一直躺在那儿。
+    #[test]
+    fn an_empty_list_writes_nothing() {
+        let mut app = app_with("fn main() {}");
+
+        assert_eq!(run(&mut app, "errors"), None);
+        assert_eq!(run(&mut app, "ls"), None);
+    }
+
+    /// ⚠️ 从清单 `:back` 要**原样放回**那份文档，不是重新读盘。
+    #[test]
+    fn errors_with_nothing_to_report_says_so_instead_of_opening() {
+        let mut app = app_with("one");
+
+        run(&mut app, "errors");
+
+        assert_eq!(app.kind, crate::app::DocumentKind::File);
+        assert!(
+            app.status_message.contains("No problems"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    /// ⚠️ 从清单 `:back` 要**原样放回**那份文档，不是重新读盘。
+    #[test]
+    fn back_from_the_list_restores_instead_of_reopening() {
+        let mut app = app_with_diagnostics();
+        app.file_path = Some("a.rs".to_string());
+        app.documents.remember("a.rs");
+        run(&mut app, "errors");
+
+        let action = run(&mut app, "back");
+
+        assert_eq!(action, Some(Action::RestoreDocument));
+    }
+
+    /// 从清单 `:back` **不做脏检查** —— 什么都没丢，没什么要拦的。
+    ///
+    /// 拦了的话你会被堵在清单里出不来（`:back` 要 `--force` 才动），
+    /// 而那正是「刚改完代码看错误」的时刻。
+    #[test]
+    fn back_from_the_list_is_not_blocked_by_unsaved_changes() {
+        let mut app = app_with_diagnostics();
+        app.file_path = Some("a.rs".to_string());
+        app.documents.remember("a.rs");
+        run(&mut app, "errors");
+        // 在清单里弄成「没保存」的样子（实际情况里它来自进清单之前那次编辑）
+        app.dirty = true;
+
+        let action = run(&mut app, "back");
+
+        assert_eq!(action, Some(Action::RestoreDocument));
+    }
+
+    // ---------- 清单不会自己长出来 ----------
+
+    /// ⚠️ 清单**不进**文档列表 —— 它不是一个「打开过的文档」。
+    ///
+    /// 进去的话有两处会立刻坏掉：
+    /// - `:ls` 会把自己也列出来，而且列一次多一条；
+    /// - `q` 会开始**在清单之间打转**（因为清单成了「上一级」）。
+    #[test]
+    fn running_ls_does_not_add_the_list_to_the_document_list() {
+        let mut app = app_with("one");
+        app.documents.remember("a.txt");
+        app.documents.remember("b.txt");
+
+        run(&mut app, "ls");
+        run(&mut app, "back");
+        run(&mut app, "ls");
+
+        // 还是那两个 —— 清单自己没混进去
+        assert_eq!(app.documents.list_text(), "1 a.txt\n2 *b.txt");
+    }
+
+    /// ⚠️ 两份清单之间来回切，**快照不跟着换**：`q` 一步就回到文档上。
+    ///
+    /// （这条只看命令层能看的那一半：`:back` 产出的是「原样放回」而不是
+    ///  「重新打开」。真正的放回动作由 main 执行，那边另有一条测试。）
+    #[test]
+    fn switching_between_two_lists_still_asks_for_a_restore_not_a_reopen() {
+        let mut app = app_with_diagnostics();
+        app.file_path = Some("a.rs".to_string());
+        app.documents.remember("a.rs");
+
+        run(&mut app, "ls");
+        assert_eq!(app.kind, crate::app::DocumentKind::DocumentList);
+        run(&mut app, "errors");
+        assert_eq!(app.kind, crate::app::DocumentKind::Errors);
+
+        // ⚠️ 必须是 RestoreDocument，不能是 OpenPath —— 后者会重新读盘、
+        //    丢掉没保存的改动，而且会被「未保存」拦下来堵在清单里
+        assert_eq!(run(&mut app, "back"), Some(Action::RestoreDocument));
+    }
+
+    /// 清单里的内容是**铺上去那一刻的快照**，之后不刷新。
+    ///
+    /// 诊断变了它也照旧 —— 这样「屏幕上这份东西是什么时候的」永远是确定的。
+    #[test]
+    fn the_list_does_not_refresh_behind_your_back() {
+        let mut app = app_with_diagnostics();
+        app.file_path = Some("a.rs".to_string());
+        run(&mut app, "errors");
+        assert_eq!(app.buffer.get_line_count(), 2);
+
+        // 服务器又推了一份（一条都没有了）
+        app.set_diagnostics(Vec::new());
+
+        assert_eq!(
+            app.buffer.get_line_count(),
+            2,
+            "清单自己刷新了 —— 那屏幕上那份东西的「年龄」就说不清了"
+        );
     }
 }

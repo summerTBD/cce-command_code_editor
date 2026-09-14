@@ -256,6 +256,13 @@ fn external_command(app: &mut App) -> Vec<Action> {
 /// 「退出」那一支故意**不做**脏检查 —— 那是用户主动放弃，而且他已经在最早打开的
 /// 那一层了，按下去就应该能走（这是当初定下的行为，保留）。
 fn back_or_quit(app: &mut App) -> Option<Action> {
+    // ⚠️ 虚拟视图（`:errors`）不在文档列表里 —— 它的「上一级」是**进它之前
+    //    那份文档**，而且必须是「原样放回来」而不是重新打开：
+    //    重新读盘会丢掉没保存的改动，而 `:errors` 根本不该碰你的文档。
+    //    所以这条路上也**不做脏检查** —— 什么都没丢，没什么要拦的。
+    if app.kind.is_virtual() {
+        return Some(Action::RestoreDocument);
+    }
     let Some(previous) = app.documents.previous_path() else {
         return Some(Action::Quit); // 没有上一级了 → 退出程序
     };
@@ -347,6 +354,30 @@ mod tests {
         // 列表里只有它自己（甚至还没 remember 过）→ 没有上一级，q 就是退出
         let mut app = App::new();
         assert_eq!(run(&mut app, press(KeyCode::Char('q'))), Some(Action::Quit));
+    }
+
+    /// ⚠️ 从 `:errors` 清单里按 `q`：**原样放回**那份文档，不是重新读盘。
+    ///
+    /// 两条都不能错：
+    ///
+    /// - 走 [`Action::OpenPath`] 的话会重新读盘 —— **丢掉没保存的改动**；
+    /// - 而且那条路上还拦着「没保存不许走」，于是你会被堵在清单里出不来，
+    ///   而那恰好是「刚改完代码、想看还剩什么错」的时刻。
+    /// - 走 `Quit` 更糟：看一眼错误就退出程序。
+    #[test]
+    fn q_from_the_error_list_restores_the_document() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo".to_string());
+        app.documents.remember("a.rs");
+        // 弄成「改过没保存」，把两条坑一次占上
+        app.cursor = Cursor { row: 0, col: 3 };
+        app.insert_char_at_cursor('!');
+        assert!(app.dirty);
+        app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
+
+        assert_eq!(
+            run(&mut app, press(KeyCode::Char('q'))),
+            Some(Action::RestoreDocument)
+        );
     }
 
     #[test]
@@ -818,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn command_ls_shows_the_document_list() {
+    fn command_ls_puts_the_document_list_on_screen() {
         let mut app = App::new();
         app.documents.remember("a.txt");
         app.documents.remember("b.txt");
@@ -826,14 +857,25 @@ mod tests {
         app.command_input = "ls".to_string();
         run(&mut app, press(KeyCode::Enter));
 
+        assert_eq!(app.kind, DocumentKind::DocumentList);
+        // ⚠️ **一行一个**。以前它挤在一行状态栏里 —— 那样长路径会把后面的
+        // 从右边挤掉，而且挤掉得没有痕迹（见 `DocumentList::list_text`）。
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("1 a.txt"));
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("2 *b.txt"));
+    }
+
+    /// 一个文档都没有时（启动没带参数就是）**不铺空清单** —— 一句话就够了。
+    #[test]
+    fn command_ls_with_nothing_open_stays_on_the_status_line() {
+        let mut app = App::new();
+        app.set_mode(EditorMode::Command);
+        app.command_input = "ls".to_string();
+        run(&mut app, press(KeyCode::Enter));
+
+        assert_eq!(app.kind, DocumentKind::File, "不该铺一份空清单上来");
         assert!(
-            app.status_message.contains("1 a.txt"),
+            app.status_message.contains("No documents"),
             "{}",
-            app.status_message
-        );
-        assert!(
-            app.status_message.contains("2 *b.txt"),
-            "当前那个应该带 *：{}",
             app.status_message
         );
     }

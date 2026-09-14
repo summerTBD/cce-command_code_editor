@@ -86,11 +86,44 @@ pub const DEFAULT_SCROLL_MARGIN: usize = 3;
 /// 默认的横向滚动边距（sidescrolloff）：光标与视口左/右边缘至少保持的列数
 pub const DEFAULT_SIDE_SCROLL_MARGIN: usize = 5;
 
+/// 默认最多同时保留几个语言服务器。
+///
+/// ## 为什么是 2
+///
+/// 实测（2026-09-14，本机，这个项目）：**一个加载完的 `rust-analyzer`
+/// 工作集约 1.2 GB**（另外 VS Code 自己那个同项目的约 0.7 GB）。
+/// 拿这个数去乘：
+///
+/// - `2` → 最坏 ~2.4 GB，而且**只在真的打开了两个项目时**才会到
+/// - `4` → 最坏 ~5 GB，对一台还开着 VS Code 的机器太多了
+///
+/// 而 `2` 恰好盖住最常见的多项目形态：**库 + 用它的程序**。
+/// 在这两个之间来回跳时不用等重新加载（冷加载要几秒）。
+///
+/// ⚠️ 会话是**用到了才起**的，不是预先养几个 —— 所以你只在一个项目里干活时，
+/// `1` 和 `2` 完全一样（都只有一个进程）。这个数字管的是「最多允许几个」。
+pub const DEFAULT_LSP_MAX_SERVERS: usize = 2;
+
 /// 默认的正文颜色
 pub const DEFAULT_TEXT_COLOR: Color = Color::Green;
 
 /// 默认的行号颜色
 pub const DEFAULT_LINE_NUMBER_COLOR: Color = Color::Yellow;
+
+/// 默认的「错误」颜色（行号染成它、`:errors` 列表里那一行也是它）。
+///
+/// 用 `LightRed` 而不是 `Red`：ANSI 的普通红（SGR 31）在深色背景上经常发暗，
+/// 而这是要**跳进眼睛里**的东西。而具体到你的终端长什么样，是你那个配色方案
+/// 说了算 —— 我们只负责说「这是亮红」。
+pub const DEFAULT_ERROR_COLOR: Color = Color::LightRed;
+
+/// 默认的「警告」颜色。
+///
+/// ⚠️ 它和**默认的行号色（黄色）挨得近**。这不是疏忽，是没办法：行号栏上
+/// 只有「颜色」这一个标记可用，而警告的惯例色就是黄的。
+/// 两者在大多数终端里还是能分开的（SGR 33 偏橄榄，SGR 93 明显更亮），
+/// 真觉得看不清就把 `[colors] line_number` 改成 `darkgray` —— 那也是很多人的首选。
+pub const DEFAULT_WARNING_COLOR: Color = Color::LightYellow;
 
 /// 默认的「当前行」背景色。0x303030 就是原来写死的 `Color::Indexed(236)`
 /// （256 色盘的 236 号正好是 #303030），换成 RGB 写法是为了让用户能直接看懂和修改。
@@ -120,6 +153,12 @@ pub const SETTINGS_TEMPLATE: &str = include_str!("../stbd-settings.example.toml"
 const MIN_TAB_WIDTH: usize = 1;
 /// `tab_width` 允许的最大值
 const MAX_TAB_WIDTH: usize = 16;
+
+/// `lsp_max_servers` 的上限。
+///
+/// 纯属**防手滑**：这个值本身没什么道理，但 1.2 GB 一个的进程让你写
+/// 一百个肯定不是你的本意，而那种笔误的后果是机器卡死。
+const MAX_LSP_MAX_SERVERS: usize = 8;
 /// `scroll_margin` / `side_scroll_margin` 允许的最大值
 const MAX_MARGIN: usize = 100;
 
@@ -143,6 +182,13 @@ pub struct Config {
     /// 光标与视口左右边缘保持的最小列距（`:set sidescrolloff N`）
     #[serde(default = "default_side_scroll_margin")]
     pub side_scroll_margin: usize,
+    /// 最多同时保留几个语言服务器；**`0` = 完全不开**。
+    ///
+    /// 为什么不是一个布尔的「开/关」：这个数字天然把两头都盖住了 ——
+    /// `0` 是关，`1` 是「只留当前项目」，`2` 是「跳回上一个项目不用等」。
+    /// 而且它们走的是**同一份代码**（一个列表 + 一个上限），不是两条路。
+    #[serde(default = "default_lsp_max_servers")]
+    pub lsp_max_servers: usize,
     /// 界面各部分用什么颜色
     #[serde(default)]
     pub colors: Colors,
@@ -165,6 +211,12 @@ pub struct Colors {
     /// 行号
     #[serde(default = "default_line_number_color", deserialize_with = "de_color")]
     pub line_number: Color,
+    /// 有错误的那一行的行号（`:errors` 列表里也用这个色）
+    #[serde(default = "default_error_color", deserialize_with = "de_color")]
+    pub error: Color,
+    /// 有警告的那一行的行号
+    #[serde(default = "default_warning_color", deserialize_with = "de_color")]
+    pub warning: Color,
     /// 当前行的背景色（想关掉高亮就写 `reset`）
     #[serde(default = "default_current_line_bg", deserialize_with = "de_color")]
     pub current_line_bg: Color,
@@ -212,6 +264,10 @@ fn default_side_scroll_margin() -> usize {
     DEFAULT_SIDE_SCROLL_MARGIN
 }
 
+fn default_lsp_max_servers() -> usize {
+    DEFAULT_LSP_MAX_SERVERS
+}
+
 // 颜色的默认值。每项单独写一个函数，理由同上：
 // 字段级 default 才能保证「只写了 [colors] 里的一项」时，其余项仍然是好看的颜色，
 // 而不是被重置成 `Color::Reset`。
@@ -222,6 +278,14 @@ fn default_text_color() -> Color {
 
 fn default_line_number_color() -> Color {
     DEFAULT_LINE_NUMBER_COLOR
+}
+
+fn default_error_color() -> Color {
+    DEFAULT_ERROR_COLOR
+}
+
+fn default_warning_color() -> Color {
+    DEFAULT_WARNING_COLOR
 }
 
 fn default_current_line_bg() -> Color {
@@ -257,6 +321,8 @@ impl Default for Colors {
         Self {
             text: default_text_color(),
             line_number: default_line_number_color(),
+            error: default_error_color(),
+            warning: default_warning_color(),
             current_line_bg: default_current_line_bg(),
             border: default_border_color(),
             command: default_command_color(),
@@ -357,6 +423,7 @@ impl Default for Config {
             tab_width: DEFAULT_TAB_WIDTH,
             scroll_margin: DEFAULT_SCROLL_MARGIN,
             side_scroll_margin: DEFAULT_SIDE_SCROLL_MARGIN,
+            lsp_max_servers: DEFAULT_LSP_MAX_SERVERS,
             colors: Colors::default(),
         }
     }
@@ -490,11 +557,17 @@ impl Config {
     /// 一行摘要，供 `:config` 命令展示当前生效的设置。
     pub fn describe(&self) -> String {
         format!(
-            "number={} tabwidth={} scrolloff={} sidescrolloff={}",
+            "number={} tabwidth={} scrolloff={} sidescrolloff={} lsp={}",
             if self.show_line_numbers { "on" } else { "off" },
             self.tab_width,
             self.scroll_margin,
-            self.side_scroll_margin
+            self.side_scroll_margin,
+            // 0 说成 `off` 比说成 `0` 清楚 —— 它不是「零个」，它就是不开了
+            if self.lsp_max_servers == 0 {
+                "off".to_string()
+            } else {
+                self.lsp_max_servers.to_string()
+            }
         )
     }
 
@@ -519,6 +592,12 @@ impl Config {
                 self.side_scroll_margin
             ));
         }
+        if self.lsp_max_servers > MAX_LSP_MAX_SERVERS {
+            return Err(format!(
+                "lsp_max_servers must be between 0 and {MAX_LSP_MAX_SERVERS}, got {}",
+                self.lsp_max_servers
+            ));
+        }
         Ok(())
     }
 }
@@ -532,8 +611,19 @@ fn ensure_file_at(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("cannot create {}: {err}", path.display()))
 }
 
+/// 「程序自己的东西」该放在哪个目录。
+///
+/// 首选**可执行文件旁边**（便携，不往系统盘塞东西），拿不到就退回用户配置目录。
+/// 配置文件和输出文件夹都从这儿长出来 —— 它们该待在一起。
+pub fn config_directory() -> Option<PathBuf> {
+    executable_dir().or_else(user_config_dir)
+}
+
 /// 可执行文件所在目录（`current_exe()` 失败时返回 `None`，比如某些受限环境）。
-fn executable_dir() -> Option<PathBuf> {
+///
+/// 公开是因为「程序自己的东西放哪儿」不止配置文件一处 —— 长输出的
+/// 输出文件夹也按同一套走（见 `outbox.rs`）。**一处定义，两边用同一个判据**。
+pub fn executable_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
@@ -841,7 +931,7 @@ side_scroll_margin = 2
     fn describe_renders_current_settings() {
         assert_eq!(
             Config::default().describe(),
-            "number=on tabwidth=8 scrolloff=3 sidescrolloff=5"
+            "number=on tabwidth=8 scrolloff=3 sidescrolloff=5 lsp=2"
         );
 
         let config = Config {
@@ -853,7 +943,52 @@ side_scroll_margin = 2
         };
         assert_eq!(
             config.describe(),
-            "number=off tabwidth=2 scrolloff=0 sidescrolloff=1"
+            "number=off tabwidth=2 scrolloff=0 sidescrolloff=1 lsp=2"
         );
+    }
+
+    /// 语言服务器那一项：`0` 说成 `off`，其余说成数字。
+    ///
+    /// `lsp=off` 比 `lsp=0` 清楚 —— 它不是「零个服务器」这种可有可无的状态，
+    /// 它就是「不用语言服务器」。
+    #[test]
+    fn describe_says_off_when_language_servers_are_disabled() {
+        let config = Config {
+            lsp_max_servers: 0,
+            ..Config::default()
+        };
+        assert!(
+            config.describe().ends_with("lsp=off"),
+            "{}",
+            config.describe()
+        );
+
+        let config = Config {
+            lsp_max_servers: 5,
+            ..Config::default()
+        };
+        assert!(
+            config.describe().ends_with("lsp=5"),
+            "{}",
+            config.describe()
+        );
+    }
+
+    /// `lsp_max_servers` 超出范围要报错（跟别的设置一个待遇：写错就该知道）。
+    #[test]
+    fn an_out_of_range_server_count_is_rejected() {
+        let config = Config {
+            lsp_max_servers: 9,
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("lsp_max_servers"), "{err}");
+
+        // 0 是**合法**的：它就是「不用语言服务器」，不是写错了
+        let config = Config {
+            lsp_max_servers: 0,
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

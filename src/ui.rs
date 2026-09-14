@@ -14,7 +14,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, EditorMode};
+use crate::app::{App, DocumentKind, EditorMode};
+use crate::diagnostic::{Diagnostic, Severity};
+use crate::outbox::OutFile;
 
 /// 主入口：把整个终端纵向切成「文本区 + 底部栏」
 pub fn render_ui(frame: &mut Frame, app: &App) {
@@ -47,7 +49,22 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
     // 顶部标题：STBD · 文件名，未保存时末尾带 *
     let file_name = app.file_path.as_deref().unwrap_or("untitled");
     let dirty_mark = if app.dirty { "*" } else { "" };
-    let title = format!(" STBD · {file_name}{dirty_mark} ");
+    let title = match app.kind {
+        // 虚拟视图里那个「文件名」不是屏幕上这份文本的名字 —— 屏幕上是一份
+        // 我们生成的清单。所以标题要说清两件事：**这是谁的什么**，
+        // 以及**它落在哪个文件里**（清单会同时写进输出文件夹，见 `outbox.rs`）。
+        DocumentKind::Errors => format!(
+            " STBD · problems in {file_name} ({})  →  {} ",
+            app.diagnostics.len(),
+            OutFile::ErrorLog.name()
+        ),
+        DocumentKind::DocumentList => format!(
+            " STBD · documents ({})  →  {} ",
+            app.buffer.get_line_count(),
+            OutFile::FileList.name()
+        ),
+        _ => format!(" STBD · {file_name}{dirty_mark} "),
+    };
 
     let border_style = Style::default().fg(colors.border);
     let outer_block = Block::bordered()
@@ -75,7 +92,7 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
             };
             spans.push(Span::styled(
                 line_number_text,
-                Style::default().fg(colors.line_number),
+                Style::default().fg(line_number_colour(app, file_row, colors.line_number)),
             ));
         }
 
@@ -115,6 +132,34 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
                 inner_area.y + row_in_viewport as u16,
             ));
         }
+    }
+}
+
+/// 这一行的行号该用哪个颜色。
+///
+/// 没有诊断（或者这是个虚拟视图）就是普通行号色。
+///
+/// ## ⚠️ 为什么只染**行号**，不染正文
+///
+/// 因为「问题在哪一列」这件事**我们根本没存** —— 诊断是按行记的
+/// （理由见 `diagnostic.rs` 的文件头）。既然不知道是哪几个字有问题，
+/// 能给的最精确的标记就是「这一行」。
+///
+/// 一个更花哨的做法（整行背景色）被否了：彩色背景在终端里很容易变成一个
+/// 色块，反倒把代码本身盖住；而下划线需要列，我们又没有。
+///
+/// ⚠️ **虚拟视图（`:errors`）永远用普通行号色**：那份清单的行号**就是**
+/// 诊断的行号，再按诊断给它们染色，等于拿自己的输出喂自己。
+fn line_number_colour(app: &App, file_row: usize, plain: Color) -> Color {
+    if app.kind.is_virtual() {
+        return plain;
+    }
+    match app.diagnostic_at_row(file_row) {
+        Some(diagnostic) if diagnostic.severity.is_marked() => match diagnostic.severity {
+            Severity::Error => app.config.colors.error,
+            _ => app.config.colors.warning,
+        },
+        _ => plain,
     }
 }
 
@@ -175,7 +220,27 @@ fn render_mode_hint(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// 最底下的状态信息行：独占一整行，长消息不容易被挤到截断
+///
+/// ## 优先级：光标那行的诊断 > status_message
+///
+/// 两样东西想用同一行。选诊断优先的理由：它是**关于你现在在哪**的，
+/// 而 status_message 是一句「刚才那件事办好了」的回执 —— 你已经在往下看了，
+/// 回执的价值就过去了。
+///
+/// ⚠️ 代价得说清楚：光标停在一行有错的地方时，`:w` 那句「Saved xxx」会被盖住。
+/// 想反过来（永远先显示回执）只需掉个顺序 —— 它是这一处的一个决定，不是散开的。
 fn render_status_line(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(diagnostic) = cursor_line_diagnostic(app) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                diagnostic.describe(),
+                Style::default().fg(severity_colour(app, diagnostic.severity)),
+            ))),
+            area,
+        );
+        return;
+    }
+
     let status = app.status_message.trim();
     if status.is_empty() {
         return;
@@ -187,6 +252,26 @@ fn render_status_line(frame: &mut Frame, app: &App, area: Rect) {
         ))),
         area,
     );
+}
+
+/// 光标所在那一行上的诊断（只认值得染色的那两档）。
+///
+/// 虚拟视图里不显示 —— 那份清单的「光标那一行」是清单自己的一行，
+/// 跟哪一行代码有毛病没关系。
+fn cursor_line_diagnostic(app: &App) -> Option<&Diagnostic> {
+    if app.kind.is_virtual() {
+        return None;
+    }
+    app.diagnostic_at_row(app.cursor.row)
+        .filter(|diagnostic| diagnostic.severity.is_marked())
+}
+
+/// 某一档严重度用哪个颜色。
+fn severity_colour(app: &App, severity: Severity) -> Color {
+    match severity {
+        Severity::Error => app.config.colors.error,
+        _ => app.config.colors.warning,
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +357,143 @@ mod tests {
         // 能画完一帧就算过
         let buffer = render_frame(&app, 80, 6);
         assert_eq!(buffer[(0, 4)].symbol(), ":");
+    }
+
+    // ---------- 诊断（行号染色 + 状态栏） ----------
+
+    use crate::app::Cursor;
+    use crate::diagnostic::Diagnostic;
+
+    fn with_diagnostics(diagnostics: Vec<Diagnostic>) -> App {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo\nthree".to_string());
+        app.set_diagnostics(diagnostics);
+        app
+    }
+
+    fn on(line: usize, severity: Severity, message: &str) -> Diagnostic {
+        Diagnostic {
+            line,
+            severity,
+            message: message.to_string(),
+        }
+    }
+
+    /// 出错那一行的**行号**变色，其它行不变 —— 正文一个字都不动。
+    #[test]
+    fn only_the_line_number_of_a_broken_line_changes_colour() {
+        let app = with_diagnostics(vec![on(1, Severity::Error, "boom")]);
+        // 高度 7：内容区能放下全部三行（上边框 1 行 + 3 行正文 + 下边框 1 行
+        // + 底部两行），这样「没问题的那两行」才真的在屏幕上
+        let buffer = render_frame(&app, 30, 7);
+
+        // 第 2 行（屏幕上第 2 个内容行）的行号是红/亮红
+        assert_eq!(buffer[(1, 2)].symbol(), "2");
+        assert_eq!(buffer[(1, 2)].fg, Colors::default().error);
+        // 正文还是原来的颜色 —— 我们**只知道是哪一行**，不知道是哪几个字
+        assert_eq!(buffer[(3, 2)].symbol(), "t");
+        assert_eq!(buffer[(3, 2)].fg, Color::Green);
+
+        // 没问题的那两行还是普通行号色
+        assert_eq!(buffer[(1, 1)].fg, Colors::default().line_number);
+        assert_eq!(buffer[(1, 3)].fg, Colors::default().line_number);
+    }
+
+    #[test]
+    fn a_warning_gets_its_own_colour() {
+        let app = with_diagnostics(vec![on(0, Severity::Warning, "meh")]);
+        let buffer = render_frame(&app, 30, 7);
+
+        assert_eq!(buffer[(1, 1)].fg, Colors::default().warning);
+    }
+
+    /// `information` / `hint` **不染色** —— 太吵了。
+    ///
+    /// 行号栏只有一个格子，而「可以加个 `const` 哦」这种提示不值得占用它。
+    /// （它们在 `:errors` 清单里还是看得见的。）
+    #[test]
+    fn hints_and_information_do_not_colour_the_gutter() {
+        for severity in [Severity::Information, Severity::Hint] {
+            let app = with_diagnostics(vec![on(0, severity, "轻轻提一句")]);
+            let buffer = render_frame(&app, 30, 7);
+
+            assert_eq!(
+                buffer[(1, 1)].fg,
+                Colors::default().line_number,
+                "{severity:?} 不该染色"
+            );
+        }
+    }
+
+    /// 同一行上错误和警告都有时，**错误说了算**（行号栏只有一个格子）。
+    #[test]
+    fn an_error_wins_over_a_warning_on_the_same_line() {
+        let app = with_diagnostics(vec![
+            on(0, Severity::Warning, "次要的"),
+            on(0, Severity::Error, "主要的"),
+        ]);
+        let buffer = render_frame(&app, 30, 7);
+
+        assert_eq!(buffer[(1, 1)].fg, Colors::default().error);
+    }
+
+    /// 状态栏显示光标那行的诊断，**原文一字不改**。
+    ///
+    /// ⚠️ 原文是我们唯一不能动的东西：用户要把它整句丢进搜索框，
+    /// 而 `cargo` 报的是同一句话。我们只在前面加了个「第几行、什么级别」的标签。
+    #[test]
+    fn the_status_line_shows_the_diagnostic_under_the_cursor() {
+        let mut app = with_diagnostics(vec![on(1, Severity::Error, "cannot find value `fo`")]);
+        app.cursor = Cursor { row: 1, col: 0 };
+
+        let buffer = render_frame(&app, 60, 6);
+
+        let status: String = (0..60).map(|x| buffer[(x, 5)].symbol()).collect();
+        assert!(
+            status.starts_with("2: error: cannot find value `fo`"),
+            "状态栏该说清楚是第几行、什么级别、原文是什么：{status:?}"
+        );
+        assert_eq!(buffer[(0, 5)].fg, Colors::default().error);
+    }
+
+    /// 光标不在出错的那一行时，状态栏照旧显示普通消息。
+    #[test]
+    fn a_diagnostic_on_another_line_does_not_hijack_the_status_line() {
+        let mut app = with_diagnostics(vec![on(2, Severity::Error, "boom")]);
+        app.cursor = Cursor { row: 0, col: 0 };
+        app.set_status_message("Saved a.rs");
+
+        let buffer = render_frame(&app, 60, 6);
+
+        let status: String = (0..60).map(|x| buffer[(x, 5)].symbol()).collect();
+        assert!(status.starts_with("Saved a.rs"), "{status:?}");
+    }
+
+    /// 虚拟视图（`:errors`）里行号**不染色**。
+    ///
+    /// ⚠️ 那份清单的行号**就是**诊断的行号。再按诊断给它们染色，等于
+    /// 拿自己的输出喂自己 —— 一行 `463: warning: ...` 会被染成
+    /// 「第 463 行有毛病」的颜色，而它只是在说别处的第 463 行。
+    #[test]
+    fn the_error_list_does_not_colour_its_own_line_numbers() {
+        let mut app = with_diagnostics(vec![on(0, Severity::Error, "boom")]);
+        app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
+
+        let buffer = render_frame(&app, 40, 7);
+
+        assert_eq!(buffer[(1, 1)].fg, Colors::default().line_number);
+    }
+
+    /// 虚拟视图的标题说得清「这是谁的问题」。
+    #[test]
+    fn the_error_list_title_names_the_file_it_came_from() {
+        let mut app = with_diagnostics(vec![on(0, Severity::Error, "boom")]);
+        app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
+
+        let buffer = render_frame(&app, 60, 6);
+
+        // ⚠️ 标题画在**上边框**上，也就是第 0 行
+        let title: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(title.contains("problems in a.rs"), "{title:?}");
+        assert!(title.contains("(1)"), "该说一条：{title:?}");
     }
 }

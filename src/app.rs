@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::buffer::Buffer;
 use crate::config::Config;
+use crate::diagnostic::Diagnostic;
 use crate::documents::DocumentList;
 use crate::undo::{DEFAULT_UNDO_LIMIT, EditKind, Snapshot, UndoStack};
 
@@ -73,6 +74,28 @@ pub enum DocumentKind {
     File,
     /// 目录的子项列表：只读的浏览视图，**不能保存**；Enter 可以「进入」光标下的条目
     DirectoryListing,
+    /// `:errors` 的清单：**我们生成的**只读视图，磁盘上没这个东西
+    ///
+    /// `file_path` 留着它**来自的那个文件**（见 [`App::show_list`]），
+    /// 所以标题和 `current_directory()` 都还对得上。
+    Errors,
+    /// `:ls` 的清单：打开过的文档，一行一个。同样是**我们生成的**只读视图。
+    DocumentList,
+}
+
+impl DocumentKind {
+    /// 它是**我们生成的**东西吗（`:errors` / `:ls` 那种清单）。
+    ///
+    /// 这个判断管的是**行为**，而且每一条都是必要的：
+    ///
+    /// - 不能 `:w` —— 把一份诊断清单写进你的源码文件？没有这个道理
+    /// - 不参与语言服务器同步 —— 清单是**我们编的文本**，发过去服务器会
+    ///   认认真真地报「这一堆字里有语法错误」，而那些错又会画到屏幕上
+    /// - 行号栏**不**染诊断色 —— 清单那几行的行号是诊断的行号，
+    ///   再按诊断染色就是拿自己的输出喂自己
+    pub fn is_virtual(self) -> bool {
+        matches!(self, Self::Errors | Self::DocumentList)
+    }
 }
 
 /// 编辑器整体状态。字段对外公开（ui.rs / update.rs 需要读它们来渲染、分发），
@@ -114,11 +137,56 @@ pub struct App {
     /// 理由跟 `run_action` 不拿 `&mut Terminal` 一样：`App` 一旦持有活着的东西，
     /// `App::new()` 就不再是纯内存对象，那一整套测试全得陪葬。
     pub checking: bool,
+    /// 服务器推来的、**当前这个文件**的诊断。
+    ///
+    /// 跟 `checking` 同一个立场：只存**数据**，不存客户端。
+    /// UI 靠它把行号染成红/黄，`:errors` 靠它列清单。
+    ///
+    /// ⚠️ 这是「这个文件**现在**的全部问题」，不是「历次问题的累积」——
+    /// 服务器每次推的是前者，所以换回来时是**整体替换**
+    /// （见 [`App::set_diagnostics`]）。
+    pub diagnostics: Vec<Diagnostic>,
     /// 撤销 / 重做栈（私有：外部只通过 `undo()` / `redo()` 使用）
     history: UndoStack,
     /// 为 true 时，内部编辑原语不再各自记录撤销步。
     /// 用于「粘贴」这类一次按键包含多次插入的整体编辑，保证整段粘贴只占一步。
     history_locked: bool,
+    /// 进虚拟视图（`:errors`）之前的样子，退出来时原样放回去。
+    ///
+    /// **只在当前处在虚拟视图里时才有值** —— 真正的文档一换就被丢掉
+    /// （见 [`App::replace_document`]），不然退出虚拟视图会把一个早就
+    /// 不该回去的旧文档翻出来。
+    saved: Option<Box<SavedDocument>>,
+}
+
+/// 一个文档的完整快照。
+///
+/// ## 为什么是快照，而不是「退出去时重新打开那个文件」
+///
+/// 因为**重新读盘会丢掉没保存的改动**。而且 `q` 那条路上还有一层拦截
+/// （没保存就不许走），于是你会被堵在清单里出不来 —— 两头都是坏事。
+///
+/// `:errors` 根本没有理由碰你的文档：它只是换了个东西给你看。
+///
+/// ## 它真的不贵
+///
+/// 看上去是「复制一份文档」，其实不是：`Buffer` 里是 rope + `Arc`，
+/// `clone()` 是 O(1)（见 `undo.rs` 里快照那段注释），撤销栈里每份快照也一样。
+/// 所以这里存的是**几个指针**，不是几份文本。
+#[derive(Debug, Clone)]
+struct SavedDocument {
+    file_path: Option<String>,
+    kind: DocumentKind,
+    buffer: Buffer,
+    cursor: Cursor,
+    viewport: Viewport,
+    /// 诊断跟着文档一起存 —— 清单就是**从它生成**的，退回那个文件时标记还得在
+    diagnostics: Vec<Diagnostic>,
+    history: UndoStack,
+    /// `dirty` 必须跟着存：它由撤销栈的修订号算出来，丢了它就会
+    /// 「改过的文件看起来像没改过」，然后 `:q` 不再拦你 —— 直接丢数据。
+    dirty: bool,
+    mode: EditorMode,
 }
 
 impl Default for App {
@@ -155,8 +223,10 @@ impl App {
             documents: DocumentList::new(),
             kind: DocumentKind::default(),
             checking: false,
+            diagnostics: Vec::new(),
             history: UndoStack::new(DEFAULT_UNDO_LIMIT),
             history_locked: false,
+            saved: None,
         }
     }
 
@@ -178,6 +248,20 @@ impl App {
     /// app.rs **不负责读文件**（那是 file_io.rs 的事），这里只接收结果并重置视图。
     /// `self.config` 属于用户偏好，换文档时原样保留。
     pub fn replace_document(&mut self, file_path: String, content: String) {
+        // ⚠️ 诊断描述的是**某一个文件**的文本，所以只在换成**另一个文件**时才清。
+        //
+        // 看上去「换文档就清掉」更保险，但那会捅出一个很阴的洞：从 `:errors`
+        // 退回原文件时（那次也是走 `replace_document`）诊断会被清掉，
+        // 而服务器**不会**再推一份 —— 它的文本一个字都没变，`Session::show`
+        // 什么都不发。于是行号上的标记凭空消失，直到你下一次敲键才回来。
+        // 那个 bug 的手感是：「我看了一眼 :errors，回来代码就没红点了，
+        // 打一个字又有了。」
+        if self.file_path.as_deref() != Some(file_path.as_str()) {
+            self.diagnostics.clear();
+        }
+        // 真正的文档一换，虚拟视图那份快照就没意义了 —— 留着它的话，
+        // 以后某次「退出虚拟视图」会把一个早就不该回去的旧文档翻出来
+        self.saved = None;
         self.buffer = Buffer::from_str(&content);
         self.file_path = Some(file_path);
         self.mode = EditorMode::ReadOnly;
@@ -191,6 +275,82 @@ impl App {
         self.history.reset();
         self.history_locked = false;
         self.sync_dirty();
+    }
+
+    // ---------- 虚拟视图（`:errors` / `:ls`） ----------
+
+    /// 把一份清单铺到屏幕上（只读）。
+    ///
+    /// `kind` 必须是[虚拟种类](DocumentKind::is_virtual) —— 它决定标题怎么写，
+    /// 也决定退出时能不能回到原来那份文档。
+    ///
+    /// ⚠️ 它**不动 `file_path`**，也**不动 `diagnostics`**：
+    ///
+    /// - `file_path` 留着，`current_directory()` 才继承得到那个文件的目录，
+    ///   标题也才说得清「这是谁的问题」
+    /// - `diagnostics` 留着 —— `:errors` 那份清单就是**从它生成**的，
+    ///   而且退回那个文件时标记还得在（见 [`App::replace_document`]）
+    ///
+    /// 进它之前的那份文档会被整个存下来（见 [`SavedDocument`]），
+    /// 退出时由 [`App::restore_document`] 原样放回去。
+    ///
+    /// ⚠️ 内容是**快照**：铺上之后就不管了。清单要在里面做的事（比如诊断又变了）
+    /// 不会让它自己刷新 —— 想看新的就再敲一次那个命令。
+    pub fn show_list(&mut self, kind: DocumentKind, content: String) {
+        // 只接受虚拟种类。传 `File` 进来会让「这是个虚拟视图」这个前提悄悄失效，
+        // 而上面那一大串基于它的判断（不保存、不同步、不染诊断）全都跟着错。
+        debug_assert!(kind.is_virtual(), "show_list 只用来铺虚拟清单");
+
+        // ⚠️ 已经在虚拟视图里就**别覆盖快照** —— 连着敲两次 `:errors`
+        //    会把「清单自己」存成快照，于是退出去是退回清单上，
+        //    再退一次才回得到文档，而用户按的明明是同一件事。
+        if !self.kind.is_virtual() {
+            self.saved = Some(Box::new(SavedDocument {
+                file_path: self.file_path.clone(),
+                kind: self.kind,
+                buffer: self.buffer.clone(),
+                cursor: self.cursor,
+                viewport: self.viewport,
+                diagnostics: self.diagnostics.clone(),
+                history: self.history.clone(),
+                dirty: self.dirty,
+                mode: self.mode,
+            }));
+        }
+
+        self.buffer = Buffer::from_str(&content);
+        self.mode = EditorMode::ReadOnly;
+        self.cursor = Cursor::default();
+        self.viewport = Viewport::default();
+        self.command_input.clear();
+        self.status_message.clear();
+        self.kind = kind;
+        // 撤销历史在这里也清掉：清单是只读的，而按 `u` 把**文档**的内容
+        // 变回清单里来（kind 却还是清单）是个说不清的状态
+        self.history.reset();
+        self.history_locked = false;
+        self.sync_dirty();
+    }
+
+    /// 从虚拟视图退回原来那份文档；没进过虚拟视图时返回 `false`。
+    ///
+    /// 退回去是**原样放回快照**，不是重新读盘 —— 理由见 [`SavedDocument`]。
+    pub fn restore_document(&mut self) -> bool {
+        let Some(saved) = self.saved.take() else {
+            return false;
+        };
+        self.file_path = saved.file_path;
+        self.kind = saved.kind;
+        self.buffer = saved.buffer;
+        self.cursor = saved.cursor;
+        self.viewport = saved.viewport;
+        self.diagnostics = saved.diagnostics;
+        self.history = saved.history;
+        self.dirty = saved.dirty;
+        self.mode = saved.mode;
+        self.command_input.clear();
+        self.status_message.clear();
+        true
     }
 
     /// 另存为之后改个名字：**只改名字**。
@@ -525,9 +685,15 @@ impl App {
         match self.kind {
             // 列表的 `file_path` 就是被列的那个目录本身
             DocumentKind::DirectoryListing => Some(path.to_string()),
-            DocumentKind::File => Path::new(path)
-                .parent()
-                .map(|dir| dir.display().to_string()),
+            // 普通文件 → 它所在的目录。
+            // `:errors` 的清单**继承**它来自的那个文件的目录 —— 这样你在清单里
+            // 敲 `:open 文件名` 仍然找得到地方，而不是掉回进程的工作目录
+            // （那个目录是隐形的，用户看不见它在哪）。
+            DocumentKind::File | DocumentKind::Errors | DocumentKind::DocumentList => {
+                Path::new(path)
+                    .parent()
+                    .map(|dir| dir.display().to_string())
+            }
         }
     }
 
@@ -692,11 +858,35 @@ impl App {
     pub fn set_status_message(&mut self, msg: impl Into<String>) {
         self.status_message = msg.into();
     }
+
+    // ---------- 诊断 ----------
+
+    /// 换上一批新诊断（服务器说「这个文件现在是这样」）。
+    ///
+    /// ⚠️ 是**整体替换**，不是追加 —— 服务器每次推的都是「这个文件现在的
+    /// *全部*问题」，追加的话**改好的错误永远擦不掉**。而这类 bug 最阴的地方在于
+    /// 它表现为「什么都没发生」：你只会觉得工具坏了，不会想到是这里多了一行 `extend`。
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        self.diagnostics = diagnostics;
+    }
+
+    /// 这一行上**最严重**的那条诊断（同一行有好几条时错误优先于警告）。
+    ///
+    /// 为什么返回最严重的一条而不是全部：行号栏只有一个格子，只能染一种颜色。
+    /// 一个格子上同时有错误和警告时，**先看错误** —— 这就是选最严重的理由。
+    /// 想看全部就上 `:errors`。
+    pub fn diagnostic_at_row(&self, row: usize) -> Option<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.line == row)
+            .max_by_key(|diagnostic| diagnostic.severity.weight())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Severity;
 
     #[test]
     fn enter_inherits_indent_and_places_cursor_after_it() {
@@ -1194,5 +1384,246 @@ mod tests {
         assert_eq!(app.buffer.get_line(1).as_deref(), Some("linXe2"));
         assert_eq!(app.cursor, Cursor { row: 1, col: 4 });
         assert!(app.dirty, "改设置不该把文档标记成已保存");
+    }
+
+    // ---------- 诊断 ----------
+
+    fn error_on(line: usize) -> Diagnostic {
+        Diagnostic {
+            line,
+            severity: Severity::Error,
+            message: format!("broken on line {line}"),
+        }
+    }
+
+    fn warning_on(line: usize) -> Diagnostic {
+        Diagnostic {
+            line,
+            severity: Severity::Warning,
+            message: format!("suspicious on line {line}"),
+        }
+    }
+
+    #[test]
+    fn a_new_file_has_no_diagnostics_at_all() {
+        let app = App::from_content(None, "fn main() {}".to_string());
+        assert!(app.diagnostics.is_empty());
+        assert!(app.diagnostic_at_row(0).is_none());
+    }
+
+    /// ⚠️ 这条守着「整体替换」。要是哪天改成追加，改好的错误就会永远留在屏幕上
+    /// —— 而且表现为「什么都没发生」，你根本不会怀疑到这里。
+    #[test]
+    fn a_new_push_replaces_the_old_diagnostics_instead_of_piling_up() {
+        let mut app = App::from_content(None, "a\nb".to_string());
+        app.set_diagnostics(vec![error_on(0), warning_on(1)]);
+        assert_eq!(app.diagnostics.len(), 2);
+
+        // 服务器说「现在只有第二行那个警告了」（第一行的错误改好了）
+        app.set_diagnostics(vec![warning_on(1)]);
+
+        assert_eq!(app.diagnostics.len(), 1);
+        assert!(
+            app.diagnostic_at_row(0).is_none(),
+            "第一行的错误已经改好了，行号栏必须变回去"
+        );
+        assert!(app.diagnostic_at_row(1).is_some());
+    }
+
+    /// 空推送是「这个文件现在没问题」，行号栏必须整个变干净。
+    #[test]
+    fn an_empty_push_clears_every_mark() {
+        let mut app = App::from_content(None, "a".to_string());
+        app.set_diagnostics(vec![error_on(0)]);
+        app.set_diagnostics(Vec::new());
+
+        assert!(app.diagnostic_at_row(0).is_none());
+    }
+
+    /// 同一行上同时有错误和警告 → **错误说了算**（行号栏只有一个格子）。
+    #[test]
+    fn the_most_severe_diagnostic_on_a_line_wins() {
+        let mut app = App::from_content(None, "a".to_string());
+        // 故意把警告放在前面：靠顺序获胜的实现会在这里露馅
+        app.set_diagnostics(vec![warning_on(0), error_on(0)]);
+
+        let winner = app.diagnostic_at_row(0).expect("这一行有两条诊断");
+        assert_eq!(winner.severity, Severity::Error);
+    }
+
+    #[test]
+    fn a_diagnostic_is_only_found_on_its_own_line() {
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        app.set_diagnostics(vec![error_on(1)]);
+
+        assert!(app.diagnostic_at_row(0).is_none());
+        assert!(app.diagnostic_at_row(1).is_some());
+        assert!(app.diagnostic_at_row(2).is_none());
+    }
+
+    /// ⚠️ 换文档必须把诊断清掉。
+    ///
+    /// 不清的话，刚打开的新文件上会挂着一堆行号颜色，而且**找不到原因** ——
+    /// 要等下一份推送来了才会被换掉，而那段空窗期里你可能已经在为一个
+    /// 根本不存在的错误苦恼了。
+    #[test]
+    fn opening_another_document_clears_the_previous_files_diagnostics() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "a".to_string());
+        app.set_diagnostics(vec![error_on(0)]);
+
+        app.replace_document("b.rs".to_string(), "b".to_string());
+
+        assert!(
+            app.diagnostics.is_empty(),
+            "上一个文件的诊断不能跟到新文件上"
+        );
+    }
+
+    /// 改设置不是换文档 —— 诊断该留着（内容都没变，问题也还在）。
+    #[test]
+    fn reloading_the_config_keeps_the_diagnostics() {
+        let mut app = App::from_content(None, "a".to_string());
+        app.set_diagnostics(vec![error_on(0)]);
+
+        app.apply_config(Config::default());
+
+        assert_eq!(app.diagnostics.len(), 1);
+    }
+
+    /// ⚠️ **重新打开同一个文件不该把诊断清掉。**
+    ///
+    /// 这条守的是从 `:errors` 退回去那一步（那次也是走 `replace_document`）。
+    /// 清掉的话，服务器**不会**再推一份 —— 它的文本一个字都没变，
+    /// `Session::show` 什么都不发 —— 于是行号上的标记凭空消失，
+    /// 直到你下次敲键才回来。
+    #[test]
+    fn reopening_the_same_file_keeps_its_diagnostics() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "a".to_string());
+        app.set_diagnostics(vec![error_on(0)]);
+
+        app.replace_document("a.rs".to_string(), "a".to_string());
+
+        assert_eq!(app.diagnostics.len(), 1, "回到同一个文件，标记不该消失");
+    }
+
+    // ---------- 虚拟视图（`:errors`） ----------
+
+    /// 进去再退出来，文档必须**一个字都没变** —— 包括光标、滚动、
+    /// 撤销栈、以及那个「改过没保存」的标记。
+    #[test]
+    fn leaving_the_error_list_puts_the_document_back_exactly_as_it_was() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo\nthree".to_string());
+        app.set_diagnostics(vec![error_on(1)]);
+        // 弄成「改过、没保存」的样子，再动一下光标和视口
+        app.set_mode(EditorMode::Edit);
+        app.cursor = Cursor { row: 1, col: 3 };
+        app.insert_char_at_cursor('!');
+        // 光标和视口放在插入**之后**设，这样它们就是我们要断言的那两个值
+        app.cursor = Cursor { row: 2, col: 3 };
+        app.viewport = Viewport { top: 1, left: 0 };
+        let text_before = app.buffer.to_string();
+        assert!(app.dirty, "先得真的改过");
+
+        app.show_list(DocumentKind::Errors, "2: error: broken".to_string());
+        assert!(app.restore_document());
+
+        assert_eq!(app.file_path.as_deref(), Some("a.rs"));
+        assert_eq!(app.kind, DocumentKind::File);
+        assert_eq!(app.buffer.to_string(), text_before, "内容不该变");
+        assert_eq!(app.cursor, Cursor { row: 2, col: 3 });
+        assert_eq!(app.viewport, Viewport { top: 1, left: 0 });
+        assert_eq!(app.diagnostics.len(), 1, "诊断得还在，行号上的标记才回得来");
+        // ⚠️ 最要紧的一条：dirty 丢了的话，`:q` 不再拦你 —— 直接丢数据
+        assert!(app.dirty, "「改过没保存」这个状态不能丢");
+        assert!(app.undo(), "撤销栈也得还在");
+    }
+
+    /// 在清单里看到的应该是清单，不是那份文档。
+    #[test]
+    fn the_error_list_is_what_gets_shown() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo".to_string());
+        app.set_diagnostics(vec![error_on(1)]);
+
+        app.show_list(DocumentKind::Errors, "2: error: broken".to_string());
+
+        assert_eq!(app.kind, DocumentKind::Errors);
+        assert!(app.kind.is_virtual());
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("2: error: broken"));
+        // `file_path` 留着 —— 标题和 `current_directory()` 都还得靠它
+        assert_eq!(app.file_path.as_deref(), Some("a.rs"));
+    }
+
+    /// ⚠️ 连敲两次 `:errors`，退一次就该回到文档上。
+    ///
+    /// 覆盖快照的话会变成：退一次回到清单、再退一次才回文档 ——
+    /// 而用户按的是**同一件事**，凭什么要走两步。
+    #[test]
+    fn asking_for_the_list_twice_still_leaves_in_one_step() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo".to_string());
+
+        app.show_list(DocumentKind::Errors, "first".to_string());
+        app.show_list(DocumentKind::Errors, "second".to_string());
+        assert!(app.restore_document());
+
+        assert_eq!(app.kind, DocumentKind::File);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("one"));
+    }
+
+    /// 从清单里打开了别的文件 → 那份快照就作废了。
+    ///
+    /// 不作废的话，之后某次「退出虚拟视图」会把一个早就不该回去的旧文档翻出来。
+    #[test]
+    fn opening_another_file_from_the_list_drops_the_snapshot() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one".to_string());
+        app.show_list(DocumentKind::Errors, "whatever".to_string());
+
+        app.replace_document("b.rs".to_string(), "bee".to_string());
+
+        assert!(!app.restore_document(), "换了文件之后不该还能退回旧文档");
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("bee"));
+    }
+
+    /// 没进过虚拟视图时退不回去。
+    #[test]
+    fn there_is_nothing_to_restore_when_no_list_was_opened() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one".to_string());
+        assert!(!app.restore_document());
+    }
+
+    /// 清单继承它来自的那个文件的目录 —— 在里面敲 `:open 名字` 才找得到地方。
+    #[test]
+    fn the_list_inherits_the_directory_of_the_file_it_came_from() {
+        let mut app = App::from_content(Some("D:\\proj\\src\\a.rs".to_string()), "one".to_string());
+        app.show_list(DocumentKind::Errors, "whatever".to_string());
+
+        assert_eq!(app.current_directory().as_deref(), Some("D:\\proj\\src"));
+    }
+
+    /// 清单是**我们生成的**文本 —— 绝不能写回磁盘。
+    #[test]
+    fn the_error_list_is_marked_as_not_a_real_file() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one".to_string());
+        app.show_list(DocumentKind::Errors, "whatever".to_string());
+
+        assert!(app.kind.is_virtual());
+        assert!(!DocumentKind::File.is_virtual());
+        assert!(!DocumentKind::DirectoryListing.is_virtual());
+        assert!(DocumentKind::DocumentList.is_virtual());
+    }
+
+    /// ⚠️ 两份清单之间来回切，**快照不跟着换** —— `q` 一步就回到文档上。
+    ///
+    /// 每进一次清单都存一份快照的话：`:ls` → `:errors` → `q` 会退到 `:ls` 上，
+    /// 再 `q` 才回文档。而用户按的明明是同一件事（我想回去），凭什么走两步。
+    #[test]
+    fn switching_between_two_lists_still_comes_back_in_one_step() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "one\ntwo".to_string());
+
+        app.show_list(DocumentKind::DocumentList, "1 *a.rs".to_string());
+        app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
+        assert!(app.restore_document());
+
+        assert_eq!(app.kind, DocumentKind::File);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("one"));
     }
 }
