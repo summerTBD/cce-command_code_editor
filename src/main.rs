@@ -8,6 +8,8 @@
 //! 5. 无论如何退出都恢复终端
 
 use std::io;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -23,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use stbd::app::{App, DocumentKind};
 use stbd::commands::Action;
 use stbd::update;
-use stbd::{config, event, file_io, ui};
+use stbd::{check, config, event, file_io, ui};
 
 /// 我们用到的终端后端类型（Crossterm 输出到 stdout）
 type Backend = CrosstermBackend<io::Stdout>;
@@ -88,38 +90,122 @@ fn release_terminal() -> io::Result<()> {
     )
 }
 
-/// 主循环：画 → 读事件 → 分发 → 执行副作用，循环往复直到退出
-fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
-    loop {
-        // 先画当前状态（每轮都会用最新的终端尺寸）
-        terminal.draw(|frame| ui::render_ui(frame, app))?;
+/// 主循环一轮最多睡这么久。
+///
+/// **这个数字就是「后台任务说的话最多晚多少被看见」。** 50ms = 20 次/秒 ——
+/// 对人眼无感，对 CPU 也基本无感，同时远低于能察觉到的延迟阈值。
+///
+/// 为什么必须有它：主循环只有一个线程，而「终端事件」和「后台消息」是两个
+/// **都会阻塞**的源（键盘等控制台句柄，通道等发送方）。一个线程一次只能在一个
+/// 地方睡着，所以只能「睡一小会儿，醒了两个都看一眼」。
+/// 完整的推演见 `COMMANDS.md` 里没有的那一段 —— 它只存在于这里：
+///
+/// - 等键盘 → 后台的活全堆着，你按下一个键才被看见
+/// - 等后台 → 服务器/任务不说话的那几秒，按键全不响应（最坏的那种 bug：
+///   间歇、依赖负载、难复现）
+///
+/// 所以答案不是「选一边」，而是「哪边都不睡死」。
+const TICK: Duration = Duration::from_millis(50);
 
-        match event::read_next_event()? {
-            event::Event::Key(key) => {
-                // update 只处理按键；把文本区估算尺寸传进去用于自动滚动
-                let (view_h, view_w) = compute_view_size(app);
-                // 一个按键可能产出多个动作（命令模式的 `&&` 链），按顺序执行
-                for action in update::handle_key_event(app, key, view_h, view_w) {
-                    match run_action(app, action) {
-                        Step::Quit => return Ok(()),
-                        // 让位：终端暂时交出去，回来之后界面还是原样
-                        Step::HandOver(line) => run_external_command(terminal, app, &line),
-                        Step::Continue => {}
+/// 主循环：**等**（终端事件或超时）→ 分发 → 收**后台消息** → 有变化才重画。
+fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
+    // 正在跑的后台检查。放在主循环的局部变量里而不是 `App` 里 ——
+    // 理由见 `App::checking` 的注释：App 只记「有没有」，不持有通道。
+    let mut check: Option<mpsc::Receiver<check::CheckReport>> = None;
+
+    // 先画一帧。新循环不再「每轮开头都画」，所以启动这一帧得自己补上，
+    // 否则打开编辑器会看到一片空白 —— 直到你按第一个键。
+    terminal.draw(|frame| ui::render_ui(frame, app))?;
+
+    loop {
+        let mut redraw = false;
+
+        // 最多等 TICK。返回 `None` = 键盘没动静，但**不等于没事可做**：
+        // 下面照样会去看后台消息。
+        if let Some(ev) = event::poll_event(TICK)? {
+            redraw = true;
+            match ev {
+                event::Event::Key(key) => {
+                    // update 只处理按键；把文本区估算尺寸传进去用于自动滚动
+                    let (view_h, view_w) = compute_view_size(app);
+                    // 一个按键可能产出多个动作（命令模式的 `&&` 链），按顺序执行
+                    for action in update::handle_key_event(app, key, view_h, view_w) {
+                        match run_action(app, action) {
+                            Step::Quit => return Ok(()),
+                            // 让位：终端暂时交出去，回来之后界面还是原样
+                            Step::HandOver(line) => run_external_command(terminal, app, &line),
+                            Step::StartCheck => check = start_check(app),
+                            Step::Continue => {}
+                        }
                     }
                 }
+                event::Event::Mouse(mouse) => {
+                    let (view_h, view_w) = compute_view_size(app);
+                    update::handle_mouse_event(app, mouse, view_h, view_w);
+                }
+                // 尺寸变化无需特殊处理：下面那次 draw 会自己用新尺寸
+                event::Event::Resize(..) => {}
+                // 粘贴：bracketed paste 已把整段文本聚合成一个事件，交给 update 分发
+                event::Event::Paste(text) => {
+                    let (view_h, view_w) = compute_view_size(app);
+                    update::handle_paste_event(app, &text, view_h, view_w);
+                }
+                event::Event::Ignored => {}
             }
-            event::Event::Mouse(mouse) => {
-                let (view_h, view_w) = compute_view_size(app);
-                update::handle_mouse_event(app, mouse, view_h, view_w);
+        }
+
+        // 把后台攒下的消息**一口气全取走**。
+        //
+        // ⚠️ 是「全取走」而不是「取一条」：任务慢了我们也不该越落越远，
+        //    取干净之后手上的状态永远是最新那一份。
+        if let Some(rx) = &check {
+            // 一口气全取走（`while`）而不是取一条：后台攒了几条就消化几条，
+            // 落后的永远只有「当前这一轮」。现在只会收到一条，但形状先立对 ——
+            // LSP 那一步消息是连绵不断的。
+            let mut finished = false;
+            while let Ok(report) = rx.try_recv() {
+                app.set_status_message(report.describe());
+                finished = true;
             }
-            // 尺寸变化无需特殊处理：下一轮 draw 会自动使用新尺寸
-            event::Event::Resize(..) => {}
-            // 粘贴：bracketed paste 已把整段文本聚合成一个事件，交给 update 按模式分发
-            event::Event::Paste(text) => {
-                let (view_h, view_w) = compute_view_size(app);
-                update::handle_paste_event(app, &text, view_h, view_w);
+
+            // ⚠️ `Disconnected` 必须和 `Empty` 分开看：前者是「发送端没了」
+            //    （正常发完就结束，或者线程 panic 了），后者是「暂时没消息」。
+            //    混为一谈的话，「任务悄悄死了」就永远发现不了，
+            //    状态栏会永远停在「Checking…」。
+            //
+            //    上面那个 `while` 已经排空了队列，所以这里返回 Disconnected
+            //    就是真的结束了 —— 而 `finished` 为真时我们已经做过汇报，
+            //    不能再补一句「线程死了」把好消息盖掉。
+            if !finished && matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                app.set_status_message("Check: the worker thread died".to_string());
+                finished = true;
             }
-            event::Event::Ignored => {}
+
+            if finished {
+                app.checking = false;
+                check = None;
+                redraw = true;
+            }
+        }
+
+        if redraw {
+            terminal.draw(|frame| ui::render_ui(frame, app))?;
+        }
+    }
+}
+
+/// 起一次后台检查，返回新的收件通道。
+///
+/// 起不来（`cargo` 不在 PATH 之类）就只写一句状态栏，**不往上抛** ——
+/// 跟 `run_action` 里那批 IO 一个立场：锦上添花的功能不该让编辑器挂掉。
+fn start_check(app: &mut App) -> Option<mpsc::Receiver<check::CheckReport>> {
+    let dir = app.current_directory();
+    match check::spawn(dir.as_deref()) {
+        Ok(receiver) => Some(receiver),
+        Err(err) => {
+            app.set_status_message(format!("Cannot run cargo check: {err}"));
+            app.checking = false;
+            None
         }
     }
 }
@@ -178,6 +264,11 @@ enum Step {
     Quit,
     /// 把终端让出去跑这一行
     HandOver(String),
+    /// 起一个后台任务（`:check`）。
+    ///
+    /// 同样得回主循环才能做：起线程、拿收件通道、以后每轮去 `try_recv` ——
+    /// 这些都是「活着的东西」，不该让 [`run_action`] 碰。
+    StartCheck,
 }
 
 /// 执行一个动作，告诉主循环下一步干什么。
@@ -212,6 +303,8 @@ fn run_action(app: &mut App, action: Action) -> Step {
         Action::ReloadConfig => reload_config(app),
         // 需要终端，交回主循环（见 [`Step`] 的说明）
         Action::RunExternal(line) => return Step::HandOver(line),
+        // 需要起线程 / 留通道，同样交回主循环
+        Action::RunCheck => return Step::StartCheck,
     }
     Step::Continue
 }

@@ -87,6 +87,12 @@ pub enum Action {
     /// 我们一个词都不分（这也是「两套语言在按键那一层分开」换来的好处）。
     /// main 负责：离开备用屏 → 跑 → 等回车 → 把界面收回来。
     RunExternal(String),
+    /// 在后台跑一次 `cargo check`（`:check`）。
+    ///
+    /// ⚠️ 跟 [`Action::RunExternal`] 恰好**相反**：那个把终端交出去、
+    /// 等你敲回车；这个一个字都不往终端写，你继续编辑，结果到了才报。
+    /// main 负责：起线程 + 留一个收件通道（见 `check::spawn`）。
+    RunCheck,
 }
 
 // ===== 命令表 =====
@@ -98,6 +104,7 @@ const BACK_USAGE: &str = "Usage: back [--force]";
 const NEXT_USAGE: &str = "Usage: next [--force]";
 const LS_USAGE: &str = "Usage: ls";
 const FORGET_USAGE: &str = "Usage: forget <n>  (n comes from :ls)";
+const CHECK_USAGE: &str = "Usage: check";
 const OPEN_USAGE: &str = "Usage: open <path> [--force]";
 const WRITE_USAGE: &str = "Usage: write [<path>]";
 const WQ_USAGE: &str = "Usage: wq";
@@ -201,6 +208,15 @@ const COMMANDS: &[Spec] = &[
         aliases: &[],
         usage: CONFIG_USAGE,
         force: true,
+    },
+    // ---- 后台任务 ----
+    Spec {
+        name: "check",
+        // 故意**不给** `:c` 别名：vim 里 `:c` 是 quickfix 那一族，
+        // 以后要加 `:errors` / 跳错误的命令时那个字母还会用到。
+        aliases: &[],
+        usage: CHECK_USAGE,
+        force: false,
     },
     // ---- 编辑 ----
     Spec {
@@ -633,6 +649,19 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         }
         ("config", ["edit"]) => open_settings(app, force),
         ("config", ["reload"]) => Ok(Some(Action::ReloadConfig)),
+
+        // ---- 后台任务 ----
+        // **先把状态置上再返回 Action**：这样按下回车的那一帧就能看到
+        // 「Checking…」—— 反馈必须在动作**开始那一刻**出现，不能等结果。
+        // 两三秒的空白最让人怀疑「是不是没反应」，而这里本来就无从知道。
+        ("check", []) => {
+            if app.checking {
+                return Err("Already checking".to_string());
+            }
+            app.checking = true;
+            app.set_status_message("Checking…");
+            Ok(Some(Action::RunCheck))
+        }
 
         // ---- 编辑 ----
         // `delete` / `copy` 的第一个位置是**起点**、第二个是**终点**（都 1 基、含两端）。
@@ -1264,6 +1293,37 @@ mod tests {
         );
     }
 
+    // ---------- 后台任务 ----------
+
+    /// `:check` 只负责「起任务 + 立刻给反馈」，**不等结果**。
+    ///
+    /// 三条性质都在这儿：
+    /// 1. 状态在按下回车那一刻就被置上 —— 不然你面对的是一两秒的空白，
+    ///    完全没法区分「在跑」和「没反应」
+    /// 2. 第二次会被挡下 —— 两个 `cargo check` 会去抢同一个 target 目录的锁
+    /// 3. 被挡下时**不产出 Action** —— 否则 main 就会起第二个线程
+    #[test]
+    fn check_starts_a_background_task_and_refuses_a_second_one() {
+        let mut app = App::new();
+        assert!(!app.checking);
+
+        assert_eq!(run(&mut app, "check"), Some(Action::RunCheck));
+        assert!(app.checking, "得把状态置上，界面才知道该显示 Checking…");
+        assert!(
+            app.status_message.contains("Checking"),
+            "{}",
+            app.status_message
+        );
+
+        // 第二次：拒绝，并且不该再产出 Action
+        assert_eq!(run(&mut app, "check"), None);
+        assert!(
+            app.status_message.contains("Already checking"),
+            "{}",
+            app.status_message
+        );
+    }
+
     // ---------- 命令表本身 ----------
 
     #[test]
@@ -1285,6 +1345,7 @@ mod tests {
             "config path",
             "config edit",
             "config reload",
+            "check",
             "delete 1",
             "copy 1",
             "swap 1 2",

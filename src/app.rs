@@ -108,6 +108,12 @@ pub struct App {
     /// 它决定的是「行为」：只有目录列表才能按 Enter 进入光标下的条目，
     /// 也只有 [`DocumentKind::File`] 才允许 `:w`。
     pub kind: DocumentKind,
+    /// 是否有 `:check` 正在后台跑。
+    ///
+    /// ⚠️ 只记「有没有」，**不持有那个通道** —— 通道是 IO 的东西，归主循环管。
+    /// 理由跟 `run_action` 不拿 `&mut Terminal` 一样：`App` 一旦持有活着的东西，
+    /// `App::new()` 就不再是纯内存对象，那一整套测试全得陪葬。
+    pub checking: bool,
     /// 撤销 / 重做栈（私有：外部只通过 `undo()` / `redo()` 使用）
     history: UndoStack,
     /// 为 true 时，内部编辑原语不再各自记录撤销步。
@@ -148,6 +154,7 @@ impl App {
             config_path: None,
             documents: DocumentList::new(),
             kind: DocumentKind::default(),
+            checking: false,
             history: UndoStack::new(DEFAULT_UNDO_LIMIT),
             history_locked: false,
         }

@@ -15,6 +15,9 @@ ratatui = "0.30.2"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 # 只用来把配置文件反序列化成 Config 结构体
 serde = { version = "1.0.229", features = ["derive"] }
+# LSP 的消息是 JSON。选它没别的理由 —— 它是事实标准，
+# 而我们只需要「把一段 JSON 变成能按字段取的东西」，用不到任何高级特性。
+serde_json = "1"
 # 配置文件的解析：只开 parse + serde + std。
 # 关掉 display（我们不写回配置文件）与 preserve_order 等，少拖几个依赖进来。
 toml = { version = "1.1.6", default-features = false, features = ["parse", "serde", "std"] }

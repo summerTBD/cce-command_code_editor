@@ -1,10 +1,12 @@
 pub mod app;
 pub mod buffer;
+pub mod check;
 pub mod commands;
 pub mod config;
 pub mod documents;
 pub mod event;
 pub mod file_io;
+pub mod lsp;
 pub mod ui;
 pub mod undo;
 pub mod update;

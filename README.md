@@ -124,6 +124,11 @@
 - `:set number` / `:set nonumber` - 显示 / 隐藏行号
 - `:set tabwidth <n>` / `:set scrolloff <n>` / `:set sidescrolloff <n>` - 改运行时的设置
 
+**后台任务**
+
+- `:check` - 在后台跑 `cargo check`，**界面不卡**。回车那一刻状态栏就显示 `Checking…`，
+  跑完把 cargo 自己的那句总结报出来（成功是 `Finished …`，失败是 `error: could not compile …`）
+
 **选项**
 
 - `--force` / `-f` - 跳过「未保存改动」的拦截，用在 `:q` `:back` `:next` `:open` `:settings` 上，

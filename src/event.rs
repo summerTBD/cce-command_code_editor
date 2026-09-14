@@ -6,9 +6,12 @@
 //! 本文件**不做**任何“这个键该干什么”的判断（那是 update.rs 的事），
 //! 也不改状态、不渲染。
 //!
-//! 说明：MVP 采用“按键驱动”——`read()` 阻塞等一个有意义的事件，
-//! 事件一到 main.rs 就处理并重绘，因此天然“实时”。
-//! 将来若要做光标闪烁动画或后台任务，再在 event.rs 里加“定时 Tick + 通道”即可。
+//! 说明：主循环用 [`poll_event`] **带超时**地等事件。超时（返回 `None`）
+//! 不是「什么都没发生」，而是「轮到我们看一眼后台任务了」。
+//!
+//! 这就是上面那段预告的「定时 Tick + 通道」，落地形状比预想的简单：
+//! **Tick 就是 `None`** —— 不需要单独造一个 `Event::Tick` 变体；
+//! 而通道归调用方管，因为 `event.rs` 不该知道谁会往里面发消息。
 
 use std::io;
 use std::time::Duration;
@@ -30,22 +33,26 @@ pub enum Event {
     Ignored,
 }
 
-/// 阻塞等待并返回下一个“关心的事件”。
+/// 最多等 `timeout`，然后返回一个「关心的事件」或 `None`。
 ///
-/// 会一直读到出现有意义的事件为止（自动跳过 `Event::Ignored`）。
-pub fn read_next_event() -> io::Result<Event> {
-    loop {
-        let ev = event::read()?;
-        match translate_crossterm_event(ev) {
-            Event::Ignored => continue,
-            ours => return Ok(ours),
-        }
+/// ⚠️ **`None` 不是「什么都没有」** —— 它是「这段时间里键盘没动静」。
+/// 对主循环来说那是一次**宝贵的机会**：正好用来看看后台任务有没有消息、
+/// 有没有到期的定时工作。所以这个超时是**特性**，不是不得已的妥协。
+///
+/// 为什么不继续用「一直阻塞到有事件」：那样主循环就只有一个耳朵，
+/// 后台任务说的话得等到你下次按键才被看见。完整的理由见 `main::run_event_loop`。
+pub fn poll_event(timeout: Duration) -> io::Result<Option<Event>> {
+    if !event::poll(timeout)? {
+        return Ok(None);
     }
-}
-
-/// 非阻塞探测：在 timeout 内是否有事件到达
-pub fn poll(timeout: Duration) -> io::Result<bool> {
-    event::poll(timeout)
+    // `poll` 说有事件了，这次 `read` 就不会再阻塞
+    match translate_crossterm_event(event::read()?) {
+        // 罕见的 `Release` 之类：当成一次空转返回。
+        // ⚠️ **不能 loop 回去重读** —— 那就又变回「可能无限期阻塞」了，
+        //    而消灭这个可能性正是本函数存在的全部理由。
+        Event::Ignored => Ok(None),
+        ours => Ok(Some(ours)),
+    }
 }
 
 /// 把 crossterm 的原始事件翻译成编辑器自己的 `Event`
