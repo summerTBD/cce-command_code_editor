@@ -163,9 +163,6 @@ warning = "lightyellow"
 # 0x303030 是原来写死的深灰
 current_line_bg = "#303030"
 
-# 文本区的边框和标题
-border = "reset"
-
 # `:` 命令输入
 command = "cyan"
 

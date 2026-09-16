@@ -258,9 +258,6 @@ pub struct Colors {
     /// 当前行的背景色（想关掉高亮就写 `reset`）
     #[serde(default = "default_current_line_bg", deserialize_with = "de_color")]
     pub current_line_bg: Color,
-    /// 文本区的边框和标题
-    #[serde(default = "default_border_color", deserialize_with = "de_color")]
-    pub border: Color,
     /// `:` 命令输入
     #[serde(default = "default_command_color", deserialize_with = "de_color")]
     pub command: Color,
@@ -330,10 +327,6 @@ fn default_current_line_bg() -> Color {
     DEFAULT_CURRENT_LINE_BG
 }
 
-fn default_border_color() -> Color {
-    Color::Reset
-}
-
 fn default_command_color() -> Color {
     Color::Cyan
 }
@@ -362,7 +355,6 @@ impl Default for Colors {
             error: default_error_color(),
             warning: default_warning_color(),
             current_line_bg: default_current_line_bg(),
-            border: default_border_color(),
             command: default_command_color(),
             mode_readonly: default_mode_readonly_color(),
             mode_edit: default_mode_edit_color(),
@@ -1060,6 +1052,67 @@ side_scroll_margin = 2
     fn reports_missing_file_instead_of_panicking() {
         let missing = std::env::temp_dir().join("stbd_config_definitely_missing_9527.toml");
         assert!(Config::load_from_file(&missing).is_err());
+    }
+
+    /// ⚠️ **README 的颜色表和配置认的键必须一一对应。**
+    ///
+    /// 模板那边已经有 `settings_template_matches_the_defaults` 守着（逐字段相等），
+    /// 但 README 是散文，漂了没有任何东西会响 —— 而这张表实际**已经漂过**：
+    /// 边框去掉之后 `border` 还挂在表里（照着它写会直接报错），
+    /// 而 `error` / `warning` 两项从来没被写上去过。
+    ///
+    /// 两个方向都查，因为症状不同：
+    /// - README 少一个键 → 用户照着表配不出来，只能去读源码
+    /// - README 多一个键 → 用户照着表写，程序报「不认识的键」
+    #[test]
+    fn the_readme_colour_table_never_drifts_from_the_template() {
+        const README: &str = include_str!("../README.md");
+
+        let (_, section) = README
+            .split_once("### 颜色")
+            .expect("README 里该有「### 颜色」一节");
+        // 只看到下一节标题为止，免得把后面别的表也算进来
+        let table = section.split("\n##").next().unwrap();
+
+        // 用**模板**当「配置认哪些键」的真相：它已经和 `Config::default()` 逐字段相等，
+        // 所以「模板 → README」这一跳成立，「默认值 → README」就跟着成立。
+        //
+        // ⚠️ 用 `rsplit_once` 而**不是** `split(..).nth(1)`：模板的**注释里**也提到
+        // `[colors]`（讲「分节必须放最后」那几句），于是 nth(1) 拿到的是「第 1 次和第 2 次
+        // 出现之间」那一小段 —— 一个颜色键都没有的空壳，而两个方向的断言都会**静默地
+        // 通过**。真那一节在文件最后，所以从右边切。
+        let (_, colors_section) = SETTINGS_TEMPLATE
+            .rsplit_once("\n[colors]")
+            .expect("模板里该有 [colors] 分节");
+
+        // ① 配置认的每个键，README 都得有一行
+        for line in colors_section.lines() {
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() || key.starts_with('#') {
+                continue;
+            }
+            assert!(
+                table.contains(&format!("| `{key}`")),
+                "README 的颜色表里少了 `{key}` —— 用户只能去读源码才知道有这一项"
+            );
+        }
+
+        // ② README 里的每个键，配置也得认
+        for row in table.lines().filter(|line| line.starts_with("| `")) {
+            let key = row
+                .trim_start_matches('|')
+                .trim_start()
+                .split('`')
+                .nth(1)
+                .unwrap_or_default();
+            assert!(
+                colors_section.contains(&format!("{key} =")),
+                "README 里写着 `{key}`，配置却不认它 —— 照着表写会直接报错"
+            );
+        }
     }
 
     // ---------- 找命令（`which`）----------

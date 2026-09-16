@@ -519,8 +519,12 @@ fn is_current_file(app: &App, uri: &str) -> bool {
 /// 估算「文本区」能显示的行/列数，供 update 里的自动滚动使用。
 ///
 /// 与 ui.rs 的布局保持一致：
-/// - 高度 = 总行数 − 底部两行（命令/模式 + 状态）− 文本区上下边框 2 行
-/// - 宽度 = 总列数 − 左右边框 2 格 − 行号栏宽度（若显示行号）
+/// - 高度 = 总行数 − 底部两行（`文件名+模式提示` 那一行 + 状态行）
+/// - 宽度 = 总列数 − 行号栏宽度（若显示行号）
+///
+/// ⚠️ **没有边框了，所以不见 `− 2` / `− 4`。** 以前这里的两个减号是「上下各一条框线」
+/// 和「左右各一格框线」—— 文本区去掉圆角框之后，第 0 行就是文件第一行、第 0 列就是
+/// 行号栏第一格。ui.rs 那边是同一套坐标（见 `render_text_area` 里的 `inner_area`）。
 fn compute_view_size(app: &App) -> (usize, usize) {
     let (columns, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     view_size_for(columns as usize, rows as usize, app)
@@ -528,7 +532,7 @@ fn compute_view_size(app: &App) -> (usize, usize) {
 
 /// [`compute_view_size`] 的**纯计算**部分：不碰终端，所以边界情况可以直接写测试。
 ///
-/// 全部用 `saturating_sub`：窗口被拖得极窄时（列数 < 边框 + 行号栏，
+/// 全部用 `saturating_sub`：窗口被拖得极窄时（列数 < 行号栏，
 /// 比如 10 列宽的文件带 6 位行号），直接相减会**下溢 panic**（debug）
 /// 或翻成一个天文数字（release），两种都不是我们想要的。
 fn view_size_for(columns: usize, rows: usize, app: &App) -> (usize, usize) {
@@ -537,8 +541,9 @@ fn view_size_for(columns: usize, rows: usize, app: &App) -> (usize, usize) {
     } else {
         0
     };
-    let view_height = rows.saturating_sub(4);
-    let view_width = columns.saturating_sub(2 + gutter_width).max(1);
+    // 底部两行：`文件名 + 模式提示` 一行，状态行一行
+    let view_height = rows.saturating_sub(2);
+    let view_width = columns.saturating_sub(gutter_width).max(1);
     (view_height, view_width)
 }
 
@@ -1233,13 +1238,16 @@ mod tests {
         );
     }
 
-    /// 尺寸换算要跟 ui.rs 的布局对齐：高 = 行数 − 4，宽 = 列数 − 2 − 行号栏
+    /// 尺寸换算要跟 ui.rs 的布局对齐：高 = 行数 − 2，宽 = 列数 − 行号栏
+    ///
+    /// ⚠️ **没有边框，所以没有那两个减号。** 以前是「高 − 4、宽 − 2 − 行号栏」：
+    /// 4 = 底部两行 + 上下两条框线，2 = 左右两条框线（见 `view_size_for`）。
     #[test]
     fn view_size_follows_the_layout() {
         let app = App::from_content(None, "hello".to_string());
         // 1 行的文件 → 行号栏「1 」占 2 格
-        assert_eq!(view_size_for(80, 24, &app), (20, 76));
-        assert_eq!(view_size_for(12, 10, &app), (6, 8));
+        assert_eq!(view_size_for(80, 24, &app), (22, 78));
+        assert_eq!(view_size_for(12, 10, &app), (8, 10));
     }
 
     /// 回归：窗口被拖得极窄时**不能 panic**。
@@ -1251,24 +1259,28 @@ mod tests {
         let app = App::from_content(None, "hello".to_string());
         assert_eq!(view_size_for(0, 0, &app), (0, 1), "宽度至少留 1");
         assert_eq!(view_size_for(1, 1, &app), (0, 1));
-        assert_eq!(view_size_for(3, 4, &app), (0, 1));
+        assert_eq!(view_size_for(3, 4, &app), (2, 1));
 
-        // 几万行的文件会把行号栏撑宽，窄窗口下依然不能下溢
+        // 几万行的文件会把行号栏撑宽（「20000」5 位 + 1 个空格 = 6 格）
         let long = (0..20_000)
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         let app = App::from_content(None, long);
-        assert_eq!(view_size_for(10, 24, &app).1, 2, "10 列放不下 6 格行号栏");
-        assert_eq!(view_size_for(20, 24, &app).1, 12);
+        assert_eq!(view_size_for(10, 24, &app).1, 4, "10 格减去 6 格行号栏");
+        // ⚠️ **窗口比行号栏还窄**才是原来那个下溢的场景：6 > 3，
+        //    相减会掉到 0 以下 —— 所以这里只能靠 saturating_sub + max(1)
+        assert_eq!(view_size_for(3, 24, &app).1, 1, "再窄也得留下 1 格正文");
+        assert_eq!(view_size_for(0, 24, &app).1, 1);
+        assert_eq!(view_size_for(20, 24, &app).1, 14);
     }
 
-    /// 关掉行号后行号栏宽为 0，整行都归正文
+    /// 关掉行号后行号栏宽为 0，整行都归正文（而且**真的**是整行 —— 没有边框了）
     #[test]
     fn view_size_without_line_numbers_uses_the_whole_width() {
         let mut app = App::from_content(None, "hello".to_string());
         app.config.show_line_numbers = false;
-        assert_eq!(view_size_for(80, 24, &app), (20, 78));
+        assert_eq!(view_size_for(80, 24, &app), (22, 80));
     }
 
     /// 回归：打开成功后必须记**完整路径**。

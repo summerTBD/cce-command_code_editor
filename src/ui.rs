@@ -4,14 +4,28 @@
 //! 它不读按键、不改状态、不做文件 I/O。
 //!
 //! 布局（自上而下）：
-//!   ┌────────────────────────────────┐  ← 文本区（Rounded 圆角边框）
-//!   │ 第1行内容                       │
-//!   │ 第2行内容                       │
-//!   └────────────────────────────────┘
-//!   [ 底部栏 ]：命令模式下显示 `:xxx` 输入框，其它模式显示模式提示/状态信息
+//! ```text
+//! 1 int main(void) { return 0; }     ← 文本区：**没有边框**，占满宽度
+//!  2
+//!  3
+//!  D:\tmp\probe\broken.c  -- READ-ONLY --  q back/quit | : command …
+//!  Saved broken.c
+//! ```
+//!
+//! ## ⚠️ 为什么没有边框
+//!
+//! 原来是 Rounded 圆角框，标题画在上边框上。去掉的理由是**和 nvim 一比就出来了**：
+//! 框的四条线是纯粹的装饰，而它占掉的正是最值钱的地方 —— 上下各一行，左右各一格。
+//! 终端的行数本来就稀缺，拿两行去画两条横线很亏。
+//!
+//! 代价是文件名没了住处（它原先是标题）。新的家是**底栏**，跟 nvim 的 statusline
+//! 一个位置：那里本来就有一行，只是原来只放模式提示。最左是文件名，因为
+//! 窄终端截断时**右边先没** —— 而「我在看哪个文件」是这一行里最不能丢的。
+//!
+//! 行号栏现在直接从**屏幕第 0 列**开始（原来被左边框挤到第 1 列）。
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, DocumentKind, EditorMode};
@@ -35,7 +49,45 @@ pub fn render_ui(frame: &mut Frame, app: &App) {
     render_status_line(frame, app, chunks[2]);
 }
 
-/// 画中间的文本区（含顶部标题、可选行号、当前行高亮、光标）
+/// 中间文本区的那一行**左侧标签** —— 也就是 nvim statusline 里放文件名的那个位置。
+///
+/// 它原来是画在顶边框上的「标题」，边框去掉之后就搬到这儿了。
+///
+/// 三种情况：
+/// - 普通文件：文件名，改过没保存时末尾带 `*`
+/// - 虚拟清单：**屏幕上那份文本不是这个文件名所指的东西** —— 说清「这是谁的什么」，
+///   以及「它落在哪个输出文件里」（清单会同时写进输出文件夹，见 `outbox.rs`）
+/// - 还没打开文件：`untitled`
+///
+/// ⚠️ **不要加 `STBD · ` 这类前缀**。这个是 nvim 的 statusline，不是标题栏；
+/// 占掉的每一格都是窄终端里最先被截掉的东西，而「我在看哪个文件」比「这是谁的程序」
+/// 要紧得多。程序名在 `:lsp` 那些地方出现已经够了。
+fn document_label(app: &App) -> String {
+    let file_name = app.file_path.as_deref().unwrap_or("untitled");
+    let dirty_mark = if app.dirty { "*" } else { "" };
+    match app.kind {
+        DocumentKind::Errors => format!(
+            "problems in {file_name} ({})  →  {}",
+            app.diagnostics.len(),
+            OutFile::ErrorLog.name()
+        ),
+        DocumentKind::DocumentList => format!(
+            "documents ({})  →  {}",
+            app.buffer.get_line_count(),
+            OutFile::FileList.name()
+        ),
+        // `:lsp` 那份不是「关于某个文件」的，所以标签里不带文件名 ——
+        // 它讲的是**整个程序**的语言服务器配置，跟你在看哪个文件无关。
+        DocumentKind::LspStatus => format!(
+            "language servers ({})  →  {}",
+            app.buffer.get_line_count(),
+            OutFile::LspStatus.name()
+        ),
+        _ => format!("{file_name}{dirty_mark}"),
+    }
+}
+
+/// 画中间的文本区（可选行号、当前行高亮、光标）。**没有边框** —— 整个 area 都是正文。
 fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
     let colors = &app.config.colors;
 
@@ -46,40 +98,10 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
         0
     };
 
-    // 顶部标题：STBD · 文件名，未保存时末尾带 *
-    let file_name = app.file_path.as_deref().unwrap_or("untitled");
-    let dirty_mark = if app.dirty { "*" } else { "" };
-    let title = match app.kind {
-        // 虚拟视图里那个「文件名」不是屏幕上这份文本的名字 —— 屏幕上是一份
-        // 我们生成的清单。所以标题要说清两件事：**这是谁的什么**，
-        // 以及**它落在哪个文件里**（清单会同时写进输出文件夹，见 `outbox.rs`）。
-        DocumentKind::Errors => format!(
-            " STBD · problems in {file_name} ({})  →  {} ",
-            app.diagnostics.len(),
-            OutFile::ErrorLog.name()
-        ),
-        DocumentKind::DocumentList => format!(
-            " STBD · documents ({})  →  {} ",
-            app.buffer.get_line_count(),
-            OutFile::FileList.name()
-        ),
-        // `:lsp` 那份不是「关于某个文件」的，所以标题不带文件名 ——
-        // 它讲的是**整个程序**的语言服务器配置，跟你在看哪个文件无关。
-        DocumentKind::LspStatus => format!(
-            " STBD · language servers ({})  →  {} ",
-            app.buffer.get_line_count(),
-            OutFile::LspStatus.name()
-        ),
-        _ => format!(" STBD · {file_name}{dirty_mark} "),
-    };
-
-    let border_style = Style::default().fg(colors.border);
-    let outer_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .border_style(border_style)
-        .title_style(border_style);
-    let inner_area = outer_block.inner(area);
+    // ⚠️ 没有边框了，所以 `area` **就是**文本区：行号从第 0 列开始，
+    //    第 0 行就是文件的第一行。把这个事实写成一个名字，
+    //    免得下面每一处坐标都要想「要不要减 1」。
+    let inner_area = area;
     let visible_height = inner_area.height as usize;
 
     // 逐行构建内容：只取「视口内可见的行」，并裁掉左侧被横向滚动走的部分
@@ -112,7 +134,7 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
         rendered_lines.push(Line::from(spans));
     }
 
-    frame.render_widget(Paragraph::new(rendered_lines).block(outer_block), area);
+    frame.render_widget(Paragraph::new(rendered_lines), area);
 
     // 光标（命令模式下光标移到底部命令栏，这里不画）
     if app.mode != EditorMode::Command {
@@ -170,7 +192,11 @@ fn line_number_colour(app: &App, file_row: usize, plain: Color) -> Color {
     }
 }
 
-/// 画底部倒数第 2 行：命令模式 = 输入框；其它模式 = 模式提示
+/// 画底部倒数第 2 行：命令模式 = 输入框；其它模式 = 「文件名 + 模式提示」
+///
+/// ⚠️ 命令模式那一支**整行都归输入框**，文件名会暂时看不见 —— 这是故意的，
+/// 和 nvim 一样（`:cmd` 那一行会盖掉 statusline）。输入框只剩一行，
+/// 再切一块给文件名，能看见的命令就更短了。
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
     match app.mode {
         EditorMode::Command => render_input_prompt(frame, app, area, ':'),
@@ -197,7 +223,19 @@ fn render_input_prompt(frame: &mut Frame, app: &App, area: Rect, prompt: char) {
     frame.set_cursor_position((x, area.y));
 }
 
-/// 非命令模式：模式名 + 快捷键提示，占一整行
+/// 非命令模式：**文件名 + 模式名 + 快捷键提示**，占一整行
+///
+/// ## ⚠️ 三段的顺序就是它们的优先级
+///
+/// 这一行太长时，ratatui 从**右边**截掉。所以最左是最不能丢的：
+///
+/// | 位置 | 内容 | 丢了会怎样 |
+/// |------|------|------------|
+/// | 1 | 文件名（+ `*`、清单那几行的说明） | 不知道自己在看哪个文件 |
+/// | 2 | `-- READ-ONLY --` / `-- EDIT --` | 不知道现在能不能打字 |
+/// | 3 | 快捷键提示 | 少个提醒，翻文档能补回来 |
+///
+/// 实测过 40 列的终端：这个顺序下前两段都完整，只有提示被切。
 fn render_mode_hint(frame: &mut Frame, app: &App, area: Rect) {
     let colors = &app.config.colors;
     let (label, label_style, hint) = match app.mode {
@@ -219,7 +257,13 @@ fn render_mode_hint(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {label} "), label_style),
+            // 文件名用**正文色**：这一行里它是主角，而 `-- READ-ONLY --` 和提示
+            // 都是暗灰的配角。想换成别的颜色只改这一处。
+            Span::styled(
+                format!(" {}  ", document_label(app)),
+                Style::default().fg(colors.text),
+            ),
+            Span::styled(format!("{label}  "), label_style),
             Span::styled(hint, Style::default().fg(colors.hint)),
         ])),
         area,
@@ -306,18 +350,18 @@ mod tests {
         let app = App::from_content(None, "hello".to_string());
         let buffer = render_frame(&app, 20, 6);
 
-        // 第 1 个内容行在第 1 行（第 0 行是上边框）；
-        // 左边框占第 0 列，行号 "1 " 占第 1-2 列，正文从第 3 列开始。
+        // **没有边框了**：第 0 行就是文件第一行，行号 "1 " 占第 0-1 列，
+        // 正文从第 2 列开始。
         //
         // ⚠️ 行号是**暗灰**而不是黄的：它得给警告色让位（见 `DEFAULT_LINE_NUMBER_COLOR`）。
-        assert_eq!(buffer[(1, 1)].symbol(), "1");
-        assert_eq!(buffer[(1, 1)].fg, Color::DarkGray, "行号应该是暗灰");
+        assert_eq!(buffer[(0, 0)].symbol(), "1");
+        assert_eq!(buffer[(0, 0)].fg, Color::DarkGray, "行号应该是暗灰");
 
-        assert_eq!(buffer[(3, 1)].symbol(), "h");
-        assert_eq!(buffer[(3, 1)].fg, Color::Green, "正文应该是绿色");
+        assert_eq!(buffer[(2, 0)].symbol(), "h");
+        assert_eq!(buffer[(2, 0)].fg, Color::Green, "正文应该是绿色");
 
         // 光标当前行会叠一层背景色
-        assert_eq!(buffer[(3, 1)].bg, Colors::default().current_line_bg);
+        assert_eq!(buffer[(2, 0)].bg, Colors::default().current_line_bg);
     }
 
     /// 改了配置之后，屏幕上应该跟着变
@@ -332,9 +376,9 @@ mod tests {
 
         let buffer = render_frame(&app, 20, 6);
 
-        assert_eq!(buffer[(1, 1)].fg, Color::Magenta);
-        assert_eq!(buffer[(3, 1)].fg, Color::Cyan);
-        assert_eq!(buffer[(3, 1)].bg, Color::Reset, "reset 应关掉当前行高亮");
+        assert_eq!(buffer[(0, 0)].fg, Color::Magenta);
+        assert_eq!(buffer[(2, 0)].fg, Color::Cyan);
+        assert_eq!(buffer[(2, 0)].bg, Color::Reset, "reset 应关掉当前行高亮");
 
         // 最底下一行是状态信息行
         let status_row = 5;
@@ -342,7 +386,7 @@ mod tests {
         assert_eq!(buffer[(0, status_row)].fg, Color::LightBlue);
     }
 
-    /// 关掉行号后，正文应该贴着左边框，不再给行号留位置
+    /// 关掉行号后，正文应该贴着屏幕最左边，不再给行号留位置
     #[test]
     fn hiding_line_numbers_shifts_text_left() {
         let mut app = App::from_content(None, "hello".to_string());
@@ -350,8 +394,8 @@ mod tests {
 
         let buffer = render_frame(&app, 20, 6);
 
-        assert_eq!(buffer[(1, 1)].symbol(), "h");
-        assert_eq!(buffer[(1, 1)].fg, Color::Green);
+        assert_eq!(buffer[(0, 0)].symbol(), "h");
+        assert_eq!(buffer[(0, 0)].fg, Color::Green);
     }
 
     /// 回归：命令输入得很长（粘一大段）时光标定位不能溢出。
@@ -391,20 +435,19 @@ mod tests {
     #[test]
     fn only_the_line_number_of_a_broken_line_changes_colour() {
         let app = with_diagnostics(vec![on(1, Severity::Error, "boom")]);
-        // 高度 7：内容区能放下全部三行（上边框 1 行 + 3 行正文 + 下边框 1 行
-        // + 底部两行），这样「没问题的那两行」才真的在屏幕上
+        // 高度 7：文本区 5 行（7 − 底部两行），三行正文都放得下
         let buffer = render_frame(&app, 30, 7);
 
         // 第 2 行（屏幕上第 2 个内容行）的行号是红/亮红
-        assert_eq!(buffer[(1, 2)].symbol(), "2");
-        assert_eq!(buffer[(1, 2)].fg, Colors::default().error);
+        assert_eq!(buffer[(0, 1)].symbol(), "2");
+        assert_eq!(buffer[(0, 1)].fg, Colors::default().error);
         // 正文还是原来的颜色 —— 我们**只知道是哪一行**，不知道是哪几个字
-        assert_eq!(buffer[(3, 2)].symbol(), "t");
-        assert_eq!(buffer[(3, 2)].fg, Color::Green);
+        assert_eq!(buffer[(2, 1)].symbol(), "t");
+        assert_eq!(buffer[(2, 1)].fg, Color::Green);
 
         // 没问题的那两行还是普通行号色
-        assert_eq!(buffer[(1, 1)].fg, Colors::default().line_number);
-        assert_eq!(buffer[(1, 3)].fg, Colors::default().line_number);
+        assert_eq!(buffer[(0, 0)].fg, Colors::default().line_number);
+        assert_eq!(buffer[(0, 2)].fg, Colors::default().line_number);
     }
 
     #[test]
@@ -412,7 +455,7 @@ mod tests {
         let app = with_diagnostics(vec![on(0, Severity::Warning, "meh")]);
         let buffer = render_frame(&app, 30, 7);
 
-        assert_eq!(buffer[(1, 1)].fg, Colors::default().warning);
+        assert_eq!(buffer[(0, 0)].fg, Colors::default().warning);
     }
 
     /// `information` / `hint` **不染色** —— 太吵了。
@@ -426,7 +469,7 @@ mod tests {
             let buffer = render_frame(&app, 30, 7);
 
             assert_eq!(
-                buffer[(1, 1)].fg,
+                buffer[(0, 0)].fg,
                 Colors::default().line_number,
                 "{severity:?} 不该染色"
             );
@@ -442,7 +485,7 @@ mod tests {
         ]);
         let buffer = render_frame(&app, 30, 7);
 
-        assert_eq!(buffer[(1, 1)].fg, Colors::default().error);
+        assert_eq!(buffer[(0, 0)].fg, Colors::default().error);
     }
 
     /// 状态栏显示光标那行的诊断，**原文一字不改**。
@@ -489,20 +532,74 @@ mod tests {
 
         let buffer = render_frame(&app, 40, 7);
 
-        assert_eq!(buffer[(1, 1)].fg, Colors::default().line_number);
+        assert_eq!(buffer[(0, 0)].fg, Colors::default().line_number);
     }
 
-    /// 虚拟视图的标题说得清「这是谁的问题」。
+    /// 虚拟视图的标签说得清「这是谁的问题」。
+    ///
+    /// ⚠️ 它现在在**底栏**（屏幕倒数第 2 行）—— 以前在上边框上，
+    /// 而边框已经去掉了。那种「东西换了个位置」的改动，测试是唯一会响的哨兵。
     #[test]
-    fn the_error_list_title_names_the_file_it_came_from() {
+    fn the_error_list_label_names_the_file_it_came_from() {
         let mut app = with_diagnostics(vec![on(0, Severity::Error, "boom")]);
         app.show_list(DocumentKind::Errors, "1: error: boom".to_string());
 
+        // 高度 6 → 底部两行是第 4、5 行，标签在第 4 行
         let buffer = render_frame(&app, 60, 6);
 
-        // ⚠️ 标题画在**上边框**上，也就是第 0 行
-        let title: String = (0..60).map(|x| buffer[(x, 0)].symbol()).collect();
-        assert!(title.contains("problems in a.rs"), "{title:?}");
-        assert!(title.contains("(1)"), "该说一条：{title:?}");
+        let label: String = (0..60).map(|x| buffer[(x, 4)].symbol()).collect();
+        assert!(label.contains("problems in a.rs"), "{label:?}");
+        assert!(label.contains("(1)"), "该说一条：{label:?}");
+        // 模式提示还在同一行，没被挤掉
+        assert!(label.contains("READ-ONLY"), "{label:?}");
+    }
+
+    /// ⚠️ **这一行最左边是文件名，而且不能被截掉。**
+    ///
+    /// 窄终端里 ratatui 从右边截，所以顺序 = 优先级：文件名 → 模式 → 提示。
+    /// 实测 40 列的终端：前两段完整，只有提示被切。
+    #[test]
+    fn the_label_comes_first_so_a_narrow_terminal_keeps_it() {
+        let app = App::from_content(Some("a.rs".to_string()), "hello".to_string());
+
+        // 40 列：完整提示（60 多个字符）放不下
+        let buffer = render_frame(&app, 40, 6);
+        let bar: String = (0..40).map(|x| buffer[(x, 4)].symbol()).collect();
+
+        assert!(
+            bar.trim_start().starts_with("a.rs"),
+            "文件名得在最左：{bar:?}"
+        );
+        assert!(bar.contains("READ-ONLY"), "模式也不能丢：{bar:?}");
+        assert!(!bar.contains("copy line"), "提示被切掉是预期内的：{bar:?}");
+    }
+
+    /// 改过没保存时，底栏的文件名要带 `*` —— 它是**唯一**能看出这一点的全局标记。
+    #[test]
+    fn the_label_carries_the_unsaved_mark() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "hello".to_string());
+        app.config.show_line_numbers = false;
+        app.set_mode(EditorMode::Edit);
+        app.insert_char_at_cursor('!');
+        assert!(app.dirty, "先得真的改过");
+
+        let buffer = render_frame(&app, 40, 6);
+        let bar: String = (0..40).map(|x| buffer[(x, 4)].symbol()).collect();
+
+        assert!(bar.trim_start().starts_with("a.rs*"), "{bar:?}");
+    }
+
+    /// 命令模式下这**整行**归输入框 —— 文件名暂时让位（和 nvim 一样）。
+    #[test]
+    fn the_command_line_takes_over_the_whole_bar() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "hello".to_string());
+        app.set_mode(EditorMode::Command);
+        app.command_input = "w".to_string();
+
+        let buffer = render_frame(&app, 40, 6);
+        let bar: String = (0..40).map(|x| buffer[(x, 4)].symbol()).collect();
+
+        assert!(bar.starts_with(":w"), "{bar:?}");
+        assert!(!bar.contains("a.rs"), "输入时文件名让位：{bar:?}");
     }
 }

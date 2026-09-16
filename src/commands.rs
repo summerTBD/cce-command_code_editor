@@ -21,6 +21,11 @@
 //! - **命令名**必须在第一个词，而且**只能是第一个词**。别名会归一化成规范名
 //!   （`d` / `del` → `delete`）。选项不能写到它前面：`-f back` 是「一条叫 `-f` 的命令」，
 //!   跟 shell 一样（`-la ls` 就是命令 `-la`），报错时会给一句定向提示。
+//! - **不分大小写**（跟 PowerShell 一个脾气）：命令名、别名、选项名、关键字参数都算 ——
+//!   `:DELETE 1 2`、`:Q`、`:open a.rs --FORCE`、`:set NUMBER` 都认。
+//!   边界是「**这个词是谁定的**」：我们定的词随便大小写，而**你写的字**
+//!   （路径、行号、要复制的文本）一个字节都不动 ——
+//!   `:open README.MD` 打开的就是那个大写名字的文件。
 //! - **选项带名字**，所以在**命令名之后**放哪都一样；**位置参数没名字**，
 //!   顺序就是它唯一的身份，必须保持。这两件事在 [`parse_command`] 里一次搞定 ——
 //!   非选项的词按遇到的顺序 push 进 `args`，而**过滤本身就是保序操作**，不用额外写什么。
@@ -308,28 +313,52 @@ const COMMANDS: &[Spec] = &[
 ];
 
 impl Spec {
-    /// 这条命令认不认这个选项。
+    /// 这个名字（规范名或别名）指的是不是这条命令 —— **不分大小写**。
+    ///
+    /// 用 `eq_ignore_ascii_case` 而不是 `to_lowercase()`，三个理由：
+    /// ① 表里全是 ASCII，够用；② `to_lowercase` 会为 `İ` 变出两个字符、
+    /// 又会把开尔文符号 `K` 折成 `k` —— 那种「聪明」在这里只会制造意外；
+    /// ③ 它不分配内存，于是每次敲回车只是几次字节比较。
+    ///
+    /// 至于「你写的字」：这个函数只在查**表**的时候被调用，碰不到它们。
+    fn answers_to(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name)
+            || self
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(name))
+    }
+
+    /// 这条命令认不认这个选项（同样**不分大小写**）。
     ///
     /// v1 只有 `--force` 一个选项，所以判断这么简单就够了；
     /// 等真有第二个选项，这里就换成一张「选项名 → 短名」的表。
+    ///
+    /// ⚠️ 只管**选项名**：`--key=value` 里的 value 是用户的数据，原样不动。
     fn accepts(&self, flag: &Flag<'_>) -> bool {
-        self.force && (flag.name == "force" || flag.name == "f")
+        self.force
+            && (flag.name.eq_ignore_ascii_case("force") || flag.name.eq_ignore_ascii_case("f"))
     }
 }
 
 /// 把别名归一化成规范名；不认识的返回原样。
+///
+/// **大小写也算归一化的一部分**：`Q` / `q` / `quit` 都归到 `quit`。
+///
+/// 返回值的生命周期跟着**输入**，但认出来的名字其实借自 `COMMANDS` 那张恒表 ——
+/// `&'static str` 可以当任意短的 `&'a str` 用。所以这里**一次分配都没有**，
+/// 也不需要一个 `Cow` 去装「有时是表里的、有时是你自己写的」这两种来路。
 fn canonical(name: &str) -> &str {
     COMMANDS
         .iter()
-        .find(|spec| spec.name == name || spec.aliases.contains(&name))
+        .find(|spec| spec.answers_to(name))
         .map(|spec| spec.name)
         .unwrap_or(name)
 }
 
-/// 查表；别名也能直接查到（`d` → `delete`）。不认识的返回 `None`。
+/// 查表；别名也能直接查到（`d` / `D` → `delete`）。不认识的返回 `None`。
 fn spec(name: &str) -> Option<&'static Spec> {
-    let name = canonical(name);
-    COMMANDS.iter().find(|spec| spec.name == name)
+    COMMANDS.iter().find(|spec| spec.answers_to(name))
 }
 
 // ===== 解析 =====
@@ -348,7 +377,7 @@ pub struct Flag<'a> {
 /// 一条解析好的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command<'a> {
-    /// 规范命令名（别名已归一化：`d` → `delete`）
+    /// 规范命令名：**别名和大写都已经归一化**（`d` / `D` → `delete`）
     pub name: &'a str,
     /// 选项
     pub flags: Vec<Flag<'a>>,
@@ -357,13 +386,13 @@ pub struct Command<'a> {
 }
 
 impl Command<'_> {
-    /// 有没有这个选项（长名、短名任写一个都算）。
+    /// 有没有这个选项（长名、短名任写一个都算，**大小写也不限**）。
     ///
     /// 用途：每个命令用它校验「认不认得这些选项」—— 见 [`reject_unknown_flags`]。
     pub fn has_flag(&self, long: &str, short: &str) -> bool {
-        self.flags
-            .iter()
-            .any(|flag| flag.name == long || flag.name == short)
+        self.flags.iter().any(|flag| {
+            flag.name.eq_ignore_ascii_case(long) || flag.name.eq_ignore_ascii_case(short)
+        })
     }
 
     /// `--force` / `-f`：跳过「未保存改动」拦截
@@ -632,6 +661,22 @@ pub fn run(app: &mut App, line: &str) -> Vec<Action> {
     actions
 }
 
+/// 这个词是不是这个**关键字** —— 不分大小写。
+///
+/// 位置参数里混着两种东西，而在这一步它们长得一模一样：
+///
+/// - **我们定的词**：`all`、`number`、`path`… 该不挑大小写；
+/// - **你写的字**：路径、行号。一个字节都不能碰 ——
+///   `:open README.MD` 里的 `README.MD` 就是文件的真名
+///   （Linux 上它和 `readme.md` 是两份东西）。
+///
+/// 区分办法不是「看这个词像不像路径」（那要靠猜，还猜不准），而是**调用点**：
+/// 只有分支明确写着「这个位置是个关键字」的地方才准用它。
+/// 所以这条函数**不许**出现在解析行号、路径、正文的地方。
+fn is_keyword(word: &str, keyword: &str) -> bool {
+    word.eq_ignore_ascii_case(keyword)
+}
+
 /// 执行单条命令（[`lex`] 切出来的一段词）。
 ///
 /// 失败一律走 `Err`：不认得的命令、写错的选项、不对的参数个数、干不成的事，
@@ -652,6 +697,10 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
 
     // ③ 按「命令名 + 位置参数形状」匹配。选项在 ② 里已经验完，
     //    所以这里只看位置参数 —— 它们是有形状的（几个、什么顺序）。
+    //
+    // ⚠️ 下面有一批 `if is_keyword(word, "…")` 的守卫。`match` 的模式是字面量，
+    //    没法写成「忽略大小写」，所以**关键字参数**只能改用守卫挑词；
+    //    命令名不用这么绕 —— 它在查表那一步就被 [`canonical`] 归一化了。
     let args = command.args.as_slice();
     let force = command.force();
     match (command.name, args) {
@@ -686,12 +735,12 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             app.set_status_message(format!("Config: {}", app.config.describe()));
             Ok(None)
         }
-        ("config", ["path"]) => {
+        ("config", [word]) if is_keyword(word, "path") => {
             report_config_path(app);
             Ok(None)
         }
-        ("config", ["edit"]) => open_settings(app, force),
-        ("config", ["reload"]) => Ok(Some(Action::ReloadConfig)),
+        ("config", [word]) if is_keyword(word, "edit") => open_settings(app, force),
+        ("config", [word]) if is_keyword(word, "reload") => Ok(Some(Action::ReloadConfig)),
 
         // ---- 后台任务 ----
         // **先把状态置上再返回 Action**：这样按下回车的那一帧就能看到
@@ -710,7 +759,7 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         // `delete` / `copy` 的第一个位置是**起点**、第二个是**终点**（都 1 基、含两端）。
         // `copy` 还多认 `行:列` 这种精确坐标 —— 位置参数只有「位置」一种概念，
         // 写 `行` 就是整行，写 `行:列` 就精确到列。一套语法，两种详略
-        ("delete", ["all"]) => {
+        ("delete", [word]) if is_keyword(word, "all") => {
             let last = app.buffer.get_line_count().to_string();
             delete_lines(app, "1", &last)?;
             Ok(None)
@@ -723,7 +772,7 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             delete_lines(app, first, last)?;
             Ok(None)
         }
-        ("copy", ["all"]) => {
+        ("copy", [word]) if is_keyword(word, "all") => {
             let last = app.buffer.get_line_count().saturating_sub(1);
             copy_range(app, (0, 0), (last, usize::MAX))
         }
@@ -748,27 +797,27 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         }
 
         // ---- 设置 ----
-        ("set", ["number"]) => {
+        ("set", [word]) if is_keyword(word, "number") => {
             app.config.show_line_numbers = true;
             Ok(None)
         }
-        ("set", ["nonumber"]) => {
+        ("set", [word]) if is_keyword(word, "nonumber") => {
             app.config.show_line_numbers = false;
             Ok(None)
         }
-        ("set", ["tabwidth", n]) => {
+        ("set", [word, n]) if is_keyword(word, "tabwidth") => {
             set_tab_width(app, n)?;
             Ok(None)
         }
-        ("set", ["scrolloff", n]) => {
+        ("set", [word, n]) if is_keyword(word, "scrolloff") => {
             set_scroll_margin(app, n)?;
             Ok(None)
         }
-        ("set", ["sidescrolloff", n]) => {
+        ("set", [word, n]) if is_keyword(word, "sidescrolloff") => {
             set_side_scroll_margin(app, n)?;
             Ok(None)
         }
-        ("set", ["lspmaxservers", n]) => {
+        ("set", [word, n]) if is_keyword(word, "lspmaxservers") => {
             set_lsp_max_servers(app, n)?;
             Ok(None)
         }
@@ -1254,6 +1303,88 @@ mod tests {
     }
 
     #[test]
+    fn command_names_and_aliases_ignore_case() {
+        // PowerShell 的脾气：CapsLock 押没押上，命令都该照跑。
+        // 归一化是在查表那一步做的，所以「别名」和「大写」在这里是同一件事 ——
+        // `D` 既被认成别名 `d`，又不挑大小写。
+        for (input, expected) in [
+            ("DELETE 1 2", "delete"),
+            ("Delete 1 2", "delete"),
+            ("DEL 1 2", "delete"),
+            ("D 1 2", "delete"),
+            ("Q", "quit"),
+            ("Quit", "quit"),
+            ("OPEN x.rs", "open"),
+            ("E x.rs", "open"),
+            ("WQ", "wq"),
+            ("SeT number", "set"),
+        ] {
+            assert_eq!(parse(input).unwrap().name, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn no_two_names_collide_once_case_is_ignored() {
+        // 「不分大小写」的前提是**没有两个名字只差大小写** ——
+        // 真有的话就得挑一个，而那是个谁也记不住的规则。
+        // 这条守卫是给未来的人看的：哪天想给 `next` 再加个别名 `W`
+        // （`w` 已经是 `write` 了），这里会先红。
+        let mut seen: Vec<(String, &str)> = Vec::new();
+        for spec in COMMANDS {
+            for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+                let key = name.to_ascii_lowercase();
+                if let Some((_, owner)) = seen.iter().find(|(lower, _)| *lower == key) {
+                    panic!(
+                        "`{name}`（{}）和 `{owner}` 只差大小写 —— 那到底该认哪一个？",
+                        spec.name
+                    );
+                }
+                seen.push((key, spec.name));
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_command_in_caps_does_the_same_thing() {
+        // 「查表认得」还不够 —— 认出来之后走的必须是**同一条分支**
+        let mut app = app_with("a\nb\nc");
+        run(&mut app, "DELETE All");
+        assert_eq!(app.buffer.get_line_count(), 1, "`All` 也该算关键字");
+
+        let mut app = app_with("a");
+        assert_eq!(run(&mut app, "WRITE"), Some(Action::Save));
+        assert_eq!(
+            run(&mut app, "OPEN x.rs -F"),
+            Some(Action::OpenPath("x.rs".to_string()))
+        );
+        assert_eq!(run(&mut app, "CONFIG RELOAD"), Some(Action::ReloadConfig));
+        assert_eq!(run(&mut app, "CONFIG EDIT"), Some(Action::Settings));
+        assert_eq!(
+            chain(&mut app, "COPY ALL"),
+            vec![Action::Copy("a".to_string())]
+        );
+        run(&mut app, "SET TABWIDTH 4");
+        assert_eq!(app.config.tab_width, 4, "关键字也不该挑大小写");
+        run(&mut app, "SET NONUMBER");
+        assert!(!app.config.show_line_numbers);
+    }
+
+    #[test]
+    fn your_own_words_are_never_case_folded() {
+        // 「不分大小写」只针对**我们定的词**。位置参数里的路径是你写的字，
+        // 把它折成小写就等于改了你的意思（Linux 上 `README.MD` 和 `readme.md` 是两份）。
+        let mut app = app_with("a");
+        assert_eq!(
+            run(&mut app, "OPEN README.MD"),
+            Some(Action::OpenPath("README.MD".to_string()))
+        );
+        assert_eq!(
+            run(&mut app, "WRITE Notes.TXT"),
+            Some(Action::SaveAs("Notes.TXT".to_string()))
+        );
+    }
+
+    #[test]
     fn option_order_does_not_matter() {
         let long = parse("open x.rs --force").unwrap();
         let short = parse("open -f x.rs").unwrap();
@@ -1534,6 +1665,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(run(&mut app, "frobnicate"), None);
         assert_eq!(app.status_message, "Unknown command: frobnicate");
+
+        // 认不出来的时候**原样还给你**（连大小写一起）——
+        // 报错里自作主张换个大小写，只会让人怀疑自己刚才敲的是什么
+        let mut app = App::new();
+        assert_eq!(run(&mut app, "FROBNICATE"), None);
+        assert_eq!(app.status_message, "Unknown command: FROBNICATE");
     }
 
     #[test]
@@ -1542,6 +1679,7 @@ mod tests {
         // `!` 不认了，但不能只说「未知命令」—— vim 的手会往这儿敲
         for (input, expected_hint) in [
             ("q!", ":q --force"),
+            ("Q!", ":Q --force"),
             ("stbd! x.rs", ":stbd --force"),
             ("open! x.rs", ":open --force"),
             ("back!", ":back --force"),

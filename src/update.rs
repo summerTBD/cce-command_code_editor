@@ -164,10 +164,15 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent, view_height: usize, 
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // 文本区顶部和左侧各有 1 格边框；底部两行不属于文本区。
+            // ⚠️ **没有边框**，所以屏幕坐标直接就是内容坐标：
+            //    第 0 行 = 文件第一行（视口顶部那行），第 0 列 = 行号栏第一格。
+            //
+            // 这里原来每个坐标都要减 1（上边框占第 0 行、左边框占第 0 列）。
+            // 去掉方框时把这一处漏掉的话，点第一行会往上跳一行、
+            // 点第一个字会往左跳一格 —— 而「差一格」手感上很像「鼠标不准」。
             let text_row = mouse.row as usize;
-            // 第 0 行是上边框，正文是 1..=view_height
-            if text_row == 0 || text_row > view_height {
+            // 底部两行不属于文本区（`文件名+模式提示` 一行 + 状态行一行）
+            if text_row >= view_height {
                 return;
             }
             let gutter_width = if app.config.show_line_numbers {
@@ -176,12 +181,13 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent, view_height: usize, 
                 0
             };
             let text_col = mouse.column as usize;
-            if text_col < gutter_width + 1 {
+            // 行号栏那几格不算正文（点它没有任何合理含义，直接当作没点到）
+            if text_col < gutter_width {
                 return;
             }
 
-            let row = (text_row - 1 + app.viewport.top).min(app.buffer.get_line_count() - 1);
-            let cell = text_col - 1 - gutter_width;
+            let row = (text_row + app.viewport.top).min(app.buffer.get_line_count() - 1);
+            let cell = text_col - gutter_width;
             let abs_cell = cell + app.viewport.left;
             let col = app.buffer.get_char_at_cell(row, abs_cell);
             // 点击 = 光标跳转，属于「编辑中断」：断开撤销步合并
@@ -1099,13 +1105,37 @@ mod tests {
     fn click_maps_wide_chars_by_cells() {
         let mut app = App::from_content(None, "你好世界".to_string());
         app.config.show_line_numbers = false;
-        // 屏幕 (row=1, col=3)：上边框下第一行、左边框右第 3 格 → 绝对第 2 列
+        // 屏幕 (row=0, col=2)：**没有边框了**，所以第 0 行就是文件第一行，
+        // 第 2 格落在「好」的第一个格子上（「你」占 0-1 两格）
         let mut ev = mouse(MouseEventKind::Down(MouseButton::Left));
-        ev.row = 1;
-        ev.column = 3;
+        ev.row = 0;
+        ev.column = 2;
         handle_mouse_event(&mut app, ev, 10, 80);
         assert_eq!(app.cursor.row, 0);
         assert_eq!(app.cursor.col, 1); // “好”是第 2 个字符（0 基为 1）
+    }
+
+    /// 底部那两行**不属于文本区**，点到它们不该动光标。
+    ///
+    /// ⚠️ 以前这里是「第 0 行是上边框，1..=view_height 才是正文」；去掉方框之后
+    /// 正文从第 0 行开始，边界只剩**下面**那一头。这个方向搞反了的话，
+    /// 点底栏会跳到最后一行 —— 而底栏正好是你会随手点一下的地方。
+    #[test]
+    fn clicking_the_bottom_bars_does_not_move_the_cursor() {
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        app.cursor = Cursor { row: 1, col: 0 };
+
+        let mut ev = mouse(MouseEventKind::Down(MouseButton::Left));
+        ev.column = 2;
+        for row in [3u16, 4, 99] {
+            ev.row = row;
+            handle_mouse_event(&mut app, ev, 3, 80);
+            assert_eq!(
+                (app.cursor.row, app.cursor.col),
+                (1, 0),
+                "view_height=3 时第 {row} 行不在文本区里"
+            );
+        }
     }
 
     #[test]
