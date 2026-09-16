@@ -552,14 +552,39 @@ fn view_size_for(columns: usize, rows: usize, app: &App) -> (usize, usize) {
 /// 用 `arboard` 直接调操作系统的剪贴板 API（Windows 上是 Win32 clipboard），
 /// **不依赖终端**支持 OSC 52，所以哪个终端都能用。
 fn copy_to_clipboard(app: &mut App, text: &str) {
-    let result = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string()));
-    match result {
+    match write_clipboard(text) {
         Ok(()) => app.set_status_message(format!(
             "Copied {} chars to clipboard",
             text.chars().count()
         )),
         Err(err) => app.set_status_message(format!("Copy failed: {err}")),
     }
+}
+
+/// 执行剪切动作（`Action::Cut`）：那几行**已经**从文档里删掉了，这里只负责写剪贴板。
+///
+/// ⚠️ 失败时的措辞要多说一句：内容已经从文档里没了，只报一句 `Copy failed`
+/// 会让人以为「什么都没发生」，而实际上那几行真没了 ——
+/// 得告诉他 `u` 能把它们找回来。
+fn cut_to_clipboard(app: &mut App, text: &str, rows: usize) {
+    let what = if rows == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{rows} lines")
+    };
+    match write_clipboard(text) {
+        Ok(()) => app.set_status_message(format!("Cut {what} to clipboard")),
+        Err(err) => app.set_status_message(format!(
+            "Clipboard failed: {err}  (the cut still removed {what}; `u` to undo)"
+        )),
+    }
+}
+
+/// 真正碰剪贴板的那一下。`Copy` 和 `Cut` 共用，只有回执不一样。
+fn write_clipboard(text: &str) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text.to_string()))
+        .map_err(|err| err.to_string())
 }
 
 /// 一个动作执行完之后，主循环该干什么。
@@ -613,6 +638,7 @@ fn run_action(app: &mut App, action: Action) -> Step {
             }
         }
         Action::Copy(text) => copy_to_clipboard(app, &text),
+        Action::Cut { text, rows } => cut_to_clipboard(app, &text, rows),
         Action::OpenPath(path) => open_path(app, &path),
         Action::Settings => open_settings(app),
         Action::ReloadConfig => reload_config(app),

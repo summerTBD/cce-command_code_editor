@@ -163,6 +163,10 @@ warning = "lightyellow"
 # 0x303030 是原来写死的深灰
 current_line_bg = "#303030"
 
+# 选区的背景色（只读模式下按 V 圈住的那几行）
+# 偏蓝而不是深灰：和「当前行」同时出现时，色相不同才一眼分得开
+selection_bg = "#354060"
+
 # `:` 命令输入
 command = "cyan"
 
@@ -172,6 +176,9 @@ mode_readonly = "darkgray"
 # 编辑模式的模式标签（-- EDIT --）
 # 编辑模式会改文件，所以默认给个显眼的黄色提醒自己
 mode_edit = "yellow"
+
+# 行选择模式的模式标签（-- VISUAL --）
+mode_visual = "lightcyan"
 
 # 快捷键提示文字
 hint = "darkgray"

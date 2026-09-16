@@ -149,6 +149,21 @@ pub const DEFAULT_WARNING_COLOR: Color = Color::LightYellow;
 /// （256 色盘的 236 号正好是 #303030），换成 RGB 写法是为了让用户能直接看懂和修改。
 pub const DEFAULT_CURRENT_LINE_BG: Color = Color::Rgb(0x30, 0x30, 0x30);
 
+/// 默认的**选区**背景色（行选择模式下盖在圈住的那几行上）。
+///
+/// 为什么不跟「当前行」共用一个底色：那是两个不同的概念 ——
+/// 一个是「你现在在哪」，一个是「你圈住了哪几行」。而选区的底色盖在**每一行**上，
+/// 光标那一行也在内 —— 共用的话，你就分不出「光标停在这段选区的哪一头」。
+///
+/// 偏蓝而不是深灰：屏幕上同时出现两种底色时，**色相**不同才一眼分得开。
+pub const DEFAULT_SELECTION_BG: Color = Color::Rgb(0x35, 0x40, 0x60);
+
+/// 默认的「行选择」模式标签颜色（`-- VISUAL --`）。
+///
+/// 单独给一个亮青，不跟编辑模式那个黄共用：模式标签是**屏幕上最不能看错的东西**
+/// （它决定你接下来敲的字会去哪），三种模式三个颜色，不用记。
+pub const DEFAULT_MODE_VISUAL_COLOR: Color = Color::LightCyan;
+
 /// 配置文件的名字（放在哪个目录都叫这个，用户只用记一个名字）
 ///
 /// 为什么叫这个：加 `stbd-` 前缀是为了在「便携模式」下不跟别人撞名——
@@ -258,6 +273,9 @@ pub struct Colors {
     /// 当前行的背景色（想关掉高亮就写 `reset`）
     #[serde(default = "default_current_line_bg", deserialize_with = "de_color")]
     pub current_line_bg: Color,
+    /// 选区的背景色（行选择模式下圈住的那几行）
+    #[serde(default = "default_selection_bg", deserialize_with = "de_color")]
+    pub selection_bg: Color,
     /// `:` 命令输入
     #[serde(default = "default_command_color", deserialize_with = "de_color")]
     pub command: Color,
@@ -267,6 +285,9 @@ pub struct Colors {
     /// 编辑模式的模式标签（`-- EDIT --`）
     #[serde(default = "default_mode_edit_color", deserialize_with = "de_color")]
     pub mode_edit: Color,
+    /// 行选择模式的模式标签（`-- VISUAL --`）
+    #[serde(default = "default_mode_visual_color", deserialize_with = "de_color")]
+    pub mode_visual: Color,
     /// 快捷键提示文字
     #[serde(default = "default_hint_color", deserialize_with = "de_color")]
     pub hint: Color,
@@ -339,6 +360,14 @@ fn default_mode_edit_color() -> Color {
     Color::Yellow
 }
 
+fn default_selection_bg() -> Color {
+    DEFAULT_SELECTION_BG
+}
+
+fn default_mode_visual_color() -> Color {
+    DEFAULT_MODE_VISUAL_COLOR
+}
+
 fn default_hint_color() -> Color {
     Color::DarkGray
 }
@@ -355,9 +384,11 @@ impl Default for Colors {
             error: default_error_color(),
             warning: default_warning_color(),
             current_line_bg: default_current_line_bg(),
+            selection_bg: default_selection_bg(),
             command: default_command_color(),
             mode_readonly: default_mode_readonly_color(),
             mode_edit: default_mode_edit_color(),
+            mode_visual: default_mode_visual_color(),
             hint: default_hint_color(),
             status: default_status_color(),
         }

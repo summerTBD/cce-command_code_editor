@@ -29,6 +29,21 @@ pub enum EditorMode {
     ReadOnly,
     /// 编辑模式，按键直接写入文本
     Edit,
+    /// **行选择模式**（只读模式下按 `V` 进入）：光标那一端可以上下拉，
+    /// `y` / `d` / `Delete` 作用于圈住的那几行。
+    ///
+    /// ## 为什么是「行」选择，不是「字符」选择
+    ///
+    /// 因为它要伺候的三件事 —— 复制一段、剪切一段、删掉一段 —— 全是按行干的。
+    /// 而字符选择得引入「列」：选区从哪一列起、跨过多少格、宽字符和 Tab 怎么算、
+    /// 横向滚动时选区怎么跟着动 —— 全都要重新想一遍。
+    /// 这和诊断那边定下的「契约是行，不存列」是同一个取舍。
+    ///
+    /// ## 和 [`EditorMode::Edit`] 的区别（别混）
+    ///
+    /// `Edit` 里敲什么就**改文档**；这里只改**选区** —— 除了 `d` / `Delete`
+    /// 那两下（那是你明确要求改动），其余按键一个字都不会碰你的文件。
+    Visual,
     /// 命令模式，输入将被收集为命令字符串（如 `:w`、`:swap`）
     Command,
     /// 外部命令模式：输入**原样**交给系统的 shell，编辑器的语法在那里停下
@@ -127,6 +142,17 @@ impl DocumentKind {
     }
 }
 
+/// 行 `row` 在「`[first, last]` 整体挪一格」之后落到哪一行（不在区间里就不动）。
+///
+/// 单独拿出来是为了**两处用同一个算法**（光标一处、选区锚点一处）——
+/// 那两处要是各写一遍，迟早会出现「光标跟上了、锚点没跟上」这种半截状态。
+fn shifted_row(row: usize, first: usize, last: usize, up: bool) -> usize {
+    if !(first..=last).contains(&row) {
+        return row;
+    }
+    if up { row - 1 } else { row + 1 }
+}
+
 /// 编辑器整体状态。字段对外公开（ui.rs / update.rs 需要读它们来渲染、分发），
 /// 但**修改状态请走下面这些方法**，以保证光标等内部不变量不被破坏。
 pub struct App {
@@ -136,6 +162,14 @@ pub struct App {
     pub viewport: Viewport,
     /// 命令模式 / 外部命令模式时，底部那一行收集到的输入
     pub command_input: String,
+    /// 行选择模式的**锚点**（0 基行号）：钉在按下 `V` 的那一行上。
+    ///
+    /// 选区的另一端就是 `cursor.row` —— 它跟着 `j` / `k` 动。
+    ///
+    /// 它和模式是同一件事的两半：`mode == Visual` 时必然有值，反之必然没有。
+    /// **别直接改它**，走 [`App::enter_visual`] / [`App::leave_visual`]，
+    /// 否则就会造出「在 Visual 里却没有锚点」这种要么 panic 要么乱选的状态。
+    selection_anchor: Option<usize>,
     /// 底部提示条信息（如 `-- 只读模式 --`、`已保存`）
     pub status_message: String,
     /// 是否有未保存的修改（`:q` 前提示、标题栏显示 `*`）
@@ -246,6 +280,7 @@ impl App {
             command_input: String::new(),
             status_message: String::new(),
             dirty: false,
+            selection_anchor: None,
             file_path,
             config,
             config_path: None,
@@ -294,6 +329,7 @@ impl App {
         self.buffer = Buffer::from_str(&content);
         self.file_path = Some(file_path);
         self.mode = EditorMode::ReadOnly;
+        self.selection_anchor = None;
         self.cursor = Cursor::default();
         self.viewport = Viewport::default();
         self.command_input.clear();
@@ -349,6 +385,7 @@ impl App {
 
         self.buffer = Buffer::from_str(&content);
         self.mode = EditorMode::ReadOnly;
+        self.selection_anchor = None;
         self.cursor = Cursor::default();
         self.viewport = Viewport::default();
         self.command_input.clear();
@@ -376,7 +413,14 @@ impl App {
         self.diagnostics = saved.diagnostics;
         self.history = saved.history;
         self.dirty = saved.dirty;
-        self.mode = saved.mode;
+        // 快照里的模式不该是「行选择」：进虚拟视图必经 `:` 或 Enter，
+        // 而那两条路都已经把锚点清掉了。这里兜一道底 —— 万一将来多出一条路，
+        // 也不会恢复出一个「在 Visual 里却没有锚点」的怪状态。
+        self.mode = match saved.mode {
+            EditorMode::Visual => EditorMode::ReadOnly,
+            other => other,
+        };
+        self.selection_anchor = None;
         self.command_input.clear();
         self.status_message.clear();
         true
@@ -468,8 +512,13 @@ impl App {
         self.sync_dirty();
     }
 
-    /// 根据修订号刷新 `dirty` 字段（ui.rs 直接读这个字段）
-    fn sync_dirty(&mut self) {
+    /// 根据修订号刷新 `dirty` 字段（ui.rs 直接读这个字段）。
+    ///
+    /// ⚠️ `dirty` 是**算出来的缓存**，真相是撤销栈的修订号 —— 所以凡是绕过
+    /// 下面那些编辑原语、自己直接动 `buffer` 的代码，都得自己调一下它。
+    /// 忘了的代价不是「界面不好看」：文件改过却显示没改，`:q` 就不再拦你，
+    /// 于是**改动直接没了**。（`:delete` / `:swap` 就这么错过一次。）
+    pub(crate) fn sync_dirty(&mut self) {
         self.dirty = self.history.is_dirty();
     }
 
@@ -502,6 +551,11 @@ impl App {
     pub fn set_mode(&mut self, mode: EditorMode) {
         // 模式切换视为一次「编辑中断」：之后的输入应开启新的撤销步
         self.history.break_merge();
+        // 离开行选择模式就得丢掉锚点 —— 模式和锚点必须同生同死。
+        // 留一个孤儿锚点的话，下次按 `V` 会长出一个「从前一次选区」开始的奇怪选区。
+        if mode != EditorMode::Visual {
+            self.selection_anchor = None;
+        }
         self.mode = mode;
     }
 
@@ -532,6 +586,123 @@ impl App {
         self.history.break_merge();
         self.mode = EditorMode::ReadOnly;
         self.command_input.clear();
+    }
+
+    // ---------- 行选择模式（`V`） ----------
+
+    /// 进入行选择模式：锚点钉在**光标当前那一行**。
+    ///
+    /// `V` 再按一下是退出 —— 那不是这个方法的事，见 [`App::leave_visual`]。
+    pub fn enter_visual(&mut self) {
+        self.history.break_merge();
+        self.selection_anchor = Some(self.cursor.row);
+        self.mode = EditorMode::Visual;
+    }
+
+    /// 退出行选择模式（`Esc`、或者某个动作已经做完了）。
+    ///
+    /// 回到只读模式而不是「从哪来回哪去」：`V` 只有一个入口（只读模式），
+    /// 所以出口也只该有一个。
+    pub fn leave_visual(&mut self) {
+        self.history.break_merge();
+        self.selection_anchor = None;
+        self.mode = EditorMode::ReadOnly;
+    }
+
+    /// 选区覆盖的行范围（0 基、含两端）；不在行选择模式时是 `None`。
+    ///
+    /// 两端都会**随用随夹** —— 文档变短（比如上一句刚删了几行）时锚点可能落到
+    /// 文末之外，这里顺手夹住，不留一个「记得同步」的状态。
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        if self.mode != EditorMode::Visual {
+            return None;
+        }
+        let anchor = self.selection_anchor?;
+        let last_row = self.buffer.get_line_count().saturating_sub(1);
+        let a = anchor.min(last_row);
+        let b = self.cursor.row.min(last_row);
+        Some((a.min(b), a.max(b)))
+    }
+
+    /// 删掉 `[first, last]` 这几行（0 基、含两端），作为**一步可撤销的编辑**。
+    ///
+    /// ## 为什么它住在 app.rs，而不在 commands.rs
+    ///
+    /// 因为它必须一次做全三件事，少做哪件都是 bug：
+    ///
+    /// 1. **记撤销步**（[`App::begin_undoable_command`]）
+    /// 2. 改 buffer（一次删整段，避开「删一行下标前移」那种错位）
+    /// 3. **同步 `dirty`**（[`App::sync_dirty`]）
+    ///
+    /// ⚠️ 第 3 件曾经漏过：`:delete` / `:swap` 只做了前两件，于是**文件改过却
+    /// 显示没改** —— 接着 `:q` 不拦你，改动直接没了。捏成一个方法之后，
+    /// 就没有「第二个调用方忘了其中一件」的机会了。
+    ///
+    /// 返回 `false` = 越界**或区间倒着给**（这时不留空撤销步、光标也不动）。
+    pub fn delete_row_range(&mut self, first: usize, last: usize) -> bool {
+        // 倒着的区间不是「删一行」，是调用方弄错了。命令层那边会先报一句
+        // 「起必须 <= 止」，但那是**给人看的**；真正拦下来的应该是这里。
+        if first > last {
+            return false;
+        }
+        let count = last - first + 1;
+        self.begin_undoable_command();
+        if !self.buffer.delete_lines(first, count) {
+            // 没真删成 → 把刚才那一步回滚掉，不留「撤销了却什么都没变」的空步
+            self.abort_undoable_command();
+            return false;
+        }
+        self.buffer.ensure_at_least_one_line(); // 删光后保留一个空行
+        // 停在**被删掉的那一段的原地**：这是唯一一个「接着再删一次」
+        // 还说得通的位置（vim 也把光标撂在这儿）
+        self.cursor.row = first;
+        self.cursor.col = 0;
+        self.clamp_cursor_to_buffer();
+        self.sync_dirty();
+        true
+    }
+
+    /// 把 `[first, last]` 这一段整体**上移一行**（`up`）或**下移一行**，一步可撤销。
+    ///
+    /// ## 它是「用 swap 搭出来的」
+    ///
+    /// 这里**没有**第二个「移动行」的原语：一段 N 行的块挪一格，就是把它逐行跟邻居
+    /// 交换 N 次（冒泡排序里那一下）。所以用的就是 `:swap` 那个 [`Buffer::swap_lines`] ——
+    /// 一行新机制都没加。
+    ///
+    /// ⚠️ 两个方向的**交换顺序不同**，都从「被跳过的那一端」开始：
+    /// 上移时从 first 往 last 走，下移时反过来。顺序写反了会把块里的行推散。
+    ///
+    /// 返回 `false` = 区间不合法，或者**已经贴到文件头/尾**了（那时什么都不该动）。
+    pub fn move_row_range(&mut self, first: usize, last: usize, up: bool) -> bool {
+        let line_count = self.buffer.get_line_count();
+        if first > last || last >= line_count {
+            return false;
+        }
+        // 顶上那一段不能再上移，底下那一段不能再下移
+        if (up && first == 0) || (!up && last + 1 >= line_count) {
+            return false;
+        }
+
+        self.begin_undoable_command();
+        if up {
+            for row in first..=last {
+                self.buffer.swap_lines(row - 1, row);
+            }
+        } else {
+            for row in (first..=last).rev() {
+                self.buffer.swap_lines(row, row + 1);
+            }
+        }
+
+        // 光标（和选区锚点）跟着走 —— 否则连按两下 `l`，「这一段」就换人了。
+        // 上面的边界检查保证了这里不会越界：上移时 first >= 1、下移时 last + 1 < 行数。
+        self.cursor.row = shifted_row(self.cursor.row, first, last, up);
+        self.selection_anchor = self
+            .selection_anchor
+            .map(|anchor| shifted_row(anchor, first, last, up));
+        self.sync_dirty();
+        true
     }
 
     // ---------- 光标移动与滚动 ----------
@@ -1348,6 +1519,139 @@ mod tests {
             app.get_text_in_range((0, 0), (0, usize::MAX)).as_deref(),
             Some("")
         );
+    }
+
+    // ---------- 行选择（`V`） ----------
+
+    /// 造一个带内容的 App 并把光标放到第 `row` 行（0 基）
+    fn app_with_cursor(content: &str, row: usize) -> App {
+        let mut app = App::from_content(None, content.to_string());
+        app.cursor = Cursor { row, col: 0 };
+        app
+    }
+
+    #[test]
+    fn the_selection_covers_every_row_between_the_anchor_and_the_cursor() {
+        let mut app = app_with_cursor("a\nb\nc\nd", 1);
+        app.enter_visual();
+        assert_eq!(app.selection(), Some((1, 1)), "刚进来只有一行");
+
+        app.move_cursor_by(1, 0);
+        assert_eq!(app.selection(), Some((1, 2)), "往下拉就是扩");
+
+        // 越过锚点就换了一端 —— 锚点没必要跟着倒手
+        app.move_cursor_by(-2, 0);
+        assert_eq!(app.selection(), Some((0, 1)));
+    }
+
+    #[test]
+    fn the_selection_is_clamped_when_the_document_shrinks() {
+        // 锚点就是「一个行号」，文档变短后可能指到文末之外。
+        // 随用随夹，就不留一个「记得跟着改」的状态。
+        let mut app = app_with_cursor("a\nb\nc\nd", 3);
+        app.enter_visual();
+        assert_eq!(app.selection(), Some((3, 3)));
+
+        assert!(app.delete_row_range(0, 2)); // 后面只剩第 3 行（现在成了第 0 行）
+        assert_eq!(app.selection(), Some((0, 0)));
+    }
+
+    #[test]
+    fn leaving_visual_drops_the_selection() {
+        let mut app = app_with_cursor("a\nb\nc", 0);
+        app.enter_visual();
+        app.move_cursor_by(1, 0);
+        app.leave_visual();
+        assert_eq!(app.mode, EditorMode::ReadOnly);
+        assert_eq!(app.selection(), None);
+
+        // 另一个出口（`set_mode`）也必须把锚点清掉 —— 否则下次 `V` 会长出
+        // 一个「从前一次选区」开始的怪选区
+        app.enter_visual();
+        app.set_mode(EditorMode::Edit);
+        assert!(app.selection_anchor.is_none());
+
+        app.enter_visual();
+        assert_eq!(app.selection(), Some((1, 1)), "重新进来应该只有光标那一行");
+    }
+
+    #[test]
+    fn delete_row_range_is_one_undo_step_and_marks_dirty() {
+        let mut app = app_with_cursor("a\nb\nc\nd", 0);
+        assert!(app.delete_row_range(1, 2));
+        assert_eq!(app.buffer.get_line_count(), 2);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("a"));
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("d"));
+        assert!(app.dirty, "改过就得变脏，否则 `:q` 会放走改动");
+        assert_eq!(app.cursor, Cursor { row: 1, col: 0 }, "停在被删那段的原地");
+
+        assert!(app.undo(), "整段删是一步，一次撤销就该全回来");
+        assert_eq!(app.buffer.get_line_count(), 4);
+        assert!(!app.dirty, "撤销回原样 → 又干净了");
+    }
+
+    #[test]
+    fn deleting_past_the_end_changes_nothing_and_leaves_no_undo_step() {
+        let mut app = app_with_cursor("a\nb", 0);
+        assert!(!app.delete_row_range(0, 5));
+        assert_eq!(app.buffer.get_line_count(), 2);
+        assert!(!app.dirty);
+        assert!(
+            !app.undo(),
+            "失败的操作不该留下「撤销了却什么都没变」的空步"
+        );
+
+        // 区间倒着给也算「不行」—— 不能默默当成「删一行」
+        assert!(!app.delete_row_range(1, 0));
+        assert_eq!(app.buffer.get_line_count(), 2);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn moving_a_block_keeps_it_together() {
+        let mut app = app_with_cursor("a\nb\nc\nd", 1);
+        assert!(app.move_row_range(1, 2, true), "b、c 上移");
+        assert_eq!(app.buffer.to_string(), "b\nc\na\nd");
+        assert!(app.move_row_range(0, 1, false), "再下移回去");
+        assert_eq!(app.buffer.to_string(), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn a_move_is_one_undo_step_and_carries_the_cursor_along() {
+        let mut app = app_with_cursor("a\nb\nc\nd", 2);
+        app.enter_visual();
+        app.move_cursor_by(1, 0); // 圈住 c、d（第 2-3 行）
+        assert_eq!(app.selection(), Some((2, 3)));
+
+        assert!(app.move_row_range(2, 3, true));
+        assert_eq!(app.buffer.to_string(), "a\nc\nd\nb");
+        assert_eq!(app.cursor.row, 2, "光标跟着块走");
+        assert_eq!(app.selection(), Some((1, 2)), "选区也一起走");
+        assert!(app.dirty);
+
+        assert!(app.undo(), "整次移行是一步");
+        assert_eq!(app.buffer.to_string(), "a\nb\nc\nd");
+        assert_eq!(app.cursor.row, 3);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn moving_stops_at_the_file_edges() {
+        let mut app = app_with_cursor("a\nb", 0);
+        assert!(!app.move_row_range(0, 0, true), "最上面那行不能再上移");
+        assert!(!app.move_row_range(1, 1, false), "最下面那行不能再下移");
+        assert!(!app.move_row_range(1, 0, true), "区间倒着给也不行");
+        assert_eq!(app.buffer.to_string(), "a\nb");
+        assert!(!app.dirty);
+        assert!(!app.undo(), "没动过就不该留下撤销步");
+    }
+
+    #[test]
+    fn deleting_every_row_leaves_exactly_one_empty_line() {
+        let mut app = app_with_cursor("a\nb\nc", 0);
+        assert!(app.delete_row_range(0, 2));
+        assert_eq!(app.buffer.get_line_count(), 1);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some(""));
     }
 
     #[test]

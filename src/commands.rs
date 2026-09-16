@@ -26,6 +26,15 @@
 //!   边界是「**这个词是谁定的**」：我们定的词随便大小写，而**你写的字**
 //!   （路径、行号、要复制的文本）一个字节都不动 ——
 //!   `:open README.MD` 打开的就是那个大写名字的文件。
+//!   三处用的是**同一条规矩**：把词**折成表里那个写法**，再查表 ——
+//!   命令名 / 别名折在查表那一步（[`canonical`]，认出就返回表里那条命令的 `name`，
+//!   一次分配都没有）；关键字参数折在执行前（[`KEYWORDS`] 表，同样给回表里的写法）；
+//!   选项名折在解析那一步（[`parse_flag`]；选项还没有表 —— 今天只有一个 `--force`，
+//!   所以它是真折了一个小写串）。折完之后**所有比较都是普通的 `==`**。
+//!
+//!   为什么不干脆把整行折成小写：`args` 里混着**你写的字**（路径）——
+//!   `:open README.MD` 折了就变成另一个文件（Linux 上那真是两份东西）。
+//!   只有**表上声明过的词**才折，别的原样传下去。
 //! - **选项带名字**，所以在**命令名之后**放哪都一样；**位置参数没名字**，
 //!   顺序就是它唯一的身份，必须保持。这两件事在 [`parse_command`] 里一次搞定 ——
 //!   非选项的词按遇到的顺序 push 进 `args`，而**过滤本身就是保序操作**，不用额外写什么。
@@ -47,6 +56,8 @@
 //! 这三条都是从 POSIX shell 的**本质**里挑出来的：它那些转义和拼接是为了伺候「展开」
 //! （变量、通配、命令替换），而这里根本没有展开 —— 搬过来就只是白拿复杂度。
 //! 详细理由写在 [`lex`] 的文档上。
+
+use std::borrow::Cow;
 
 use crate::app::{App, DocumentKind, EditorMode};
 use crate::config::Config;
@@ -76,6 +87,17 @@ pub enum Action {
     SaveAndQuit,
     /// 把这段文本写入系统剪贴板
     Copy(String),
+    /// 剪切：这段文本**已经**从文档里删掉了，现在把它写进剪贴板。
+    ///
+    /// 和 [`Action::Copy`] 分成两个变体，**只为了回执说得准**：main 是最后写状态栏的
+    /// 那个人（剪贴板成没成只有它知道），可它从一段文本里看不出「这是一次剪切、
+    /// 刚删了 3 行」。带上 `rows` 它才能说出 `Cut 3 lines to clipboard`，
+    /// 而 `y` / `:copy` 那边照旧说 `Copied N chars to clipboard`。
+    ///
+    /// ⚠️ 顺序上注意：**删**发生在 [`crate::update`] 里（那一步要进撤销栈），
+    /// 写剪贴板才是这个动作。所以剪贴板万一失败，那几行也已经不在文档里了 ——
+    /// 回执里必须带上「用 `u` 能找回来」。
+    Cut { text: String, rows: usize },
     /// 打开另一个路径（文件或目录），由 main 读取后交给 App
     ///
     /// 路径**可以是相对的**。产出方只管把「用户指的是哪个路径」说出来，
@@ -329,15 +351,14 @@ impl Spec {
                 .any(|alias| alias.eq_ignore_ascii_case(name))
     }
 
-    /// 这条命令认不认这个选项（同样**不分大小写**）。
+    /// 这条命令认不认这个选项（**比较是普通的 `==`**：名字在解析时已经折成小写）。
     ///
     /// v1 只有 `--force` 一个选项，所以判断这么简单就够了；
     /// 等真有第二个选项，这里就换成一张「选项名 → 短名」的表。
     ///
     /// ⚠️ 只管**选项名**：`--key=value` 里的 value 是用户的数据，原样不动。
     fn accepts(&self, flag: &Flag<'_>) -> bool {
-        self.force
-            && (flag.name.eq_ignore_ascii_case("force") || flag.name.eq_ignore_ascii_case("f"))
+        self.force && flag.is_named("force", "f")
     }
 }
 
@@ -366,9 +387,17 @@ fn spec(name: &str) -> Option<&'static Spec> {
 /// 一个选项：`-f` / `--force` / `--key=value` 都解析成它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flag<'a> {
-    /// 名字：去掉 `-` / `--`，也去掉 `=value` 部分
-    pub name: &'a str,
-    /// `--key=value` 的值（`-f` / `--force` 是 `None`）
+    /// 名字：去掉 `-` / `--`，也去掉 `=value` 部分；**并且已经折成小写**。
+    ///
+    /// 为什么折在**解析**这一步：选项名**永远是我们定的**（不像位置参数里混着
+    /// 用户的路径），所以这里折一次，后面所有地方比的都是普通的 `==` ——
+    /// 大小写这件事不会散到每一个比较点上。
+    ///
+    /// 本来就全是小写时借原串（`Cow::Borrowed`），不分配。
+    pub name: Cow<'a, str>,
+    /// `--key=value` 的值（`-f` / `--force` 是 `None`）。
+    ///
+    /// ⚠️ 值**不折**：它是用户的数据（可能是个路径）。
     pub value: Option<&'a str>,
     /// 用户**原样**写的样子（`-f` / `--force`），只为了报错时能照原样还给他
     pub raw: &'a str,
@@ -386,18 +415,26 @@ pub struct Command<'a> {
 }
 
 impl Command<'_> {
-    /// 有没有这个选项（长名、短名任写一个都算，**大小写也不限**）。
+    /// 有没有这个选项（长名、短名任写一个都算；**比较是普通的 `==`**）。
     ///
     /// 用途：每个命令用它校验「认不认得这些选项」—— 见 [`reject_unknown_flags`]。
     pub fn has_flag(&self, long: &str, short: &str) -> bool {
-        self.flags.iter().any(|flag| {
-            flag.name.eq_ignore_ascii_case(long) || flag.name.eq_ignore_ascii_case(short)
-        })
+        self.flags.iter().any(|flag| flag.is_named(long, short))
     }
 
     /// `--force` / `-f`：跳过「未保存改动」拦截
     pub fn force(&self) -> bool {
         self.has_flag("force", "f")
+    }
+}
+
+impl<'a> Flag<'a> {
+    /// 这个选项的名字是不是 `long` / `short` 之一。
+    ///
+    /// **整个仓库比选项名的地方就只有这里** —— 所以大小写的归一化只用做一次，
+    /// 在这个方法里用普通的 `==` 就完了（名字在 [`parse_flag`] 里已经折成小写）。
+    pub fn is_named(&self, long: &str, short: &str) -> bool {
+        self.name == long || self.name == short
     }
 }
 
@@ -574,10 +611,23 @@ fn parse_flag<'a>(word: &'a str, body: &'a str) -> Result<Flag<'a>, String> {
     }
 
     Ok(Flag {
-        name,
+        name: lowercase(name),
         value,
         raw: word,
     })
+}
+
+/// 折成 ASCII 小写；本来就全是小写时**借原串**（不分配）。
+///
+/// ⚠️ 用 `to_ascii_lowercase` 而不是 `to_lowercase`：后者的 Unicode 折叠会为
+/// `İ` 变出两个字符、又会把开尔文符号 `K` 折成 `k` —— 那种「聪明」在命令语言里
+/// 只会制造意外（我们表里全是 ASCII，本来也无需它）。
+fn lowercase(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 // ===== 执行 =====
@@ -591,7 +641,7 @@ fn parse_flag<'a>(word: &'a str, body: &'a str) -> Result<Flag<'a>, String> {
 /// **失败走返回值，成功走状态栏。** 以前两者都塞在状态栏里，于是「成功但没副作用」
 /// 和「失败」长得一模一样（都是 `None`）—— `&&` 正好卡在这个歧义上。分开之后，
 /// 失败成了**控制流**（链要不要停），成功只是**汇报**（写一句就够）。
-type Executed = Result<Option<Action>, String>;
+pub(crate) type Executed = Result<Option<Action>, String>;
 
 /// 执行一整行命令（可能含 `&&` 链），返回 main 要**依次**执行的动作。
 ///
@@ -661,20 +711,48 @@ pub fn run(app: &mut App, line: &str) -> Vec<Action> {
     actions
 }
 
-/// 这个词是不是这个**关键字** —— 不分大小写。
+/// 「位置参数里哪些词是**我们定的**」—— （命令名，关键字表）。
 ///
-/// 位置参数里混着两种东西，而在这一步它们长得一模一样：
+/// 位置参数里混着两种东西，而在切完之后它们长得一模一样：
 ///
 /// - **我们定的词**：`all`、`number`、`path`… 该不挑大小写；
 /// - **你写的字**：路径、行号。一个字节都不能碰 ——
 ///   `:open README.MD` 里的 `README.MD` 就是文件的真名
 ///   （Linux 上它和 `readme.md` 是两份东西）。
 ///
-/// 区分办法不是「看这个词像不像路径」（那要靠猜，还猜不准），而是**调用点**：
-/// 只有分支明确写着「这个位置是个关键字」的地方才准用它。
-/// 所以这条函数**不许**出现在解析行号、路径、正文的地方。
-fn is_keyword(word: &str, keyword: &str) -> bool {
-    word.eq_ignore_ascii_case(keyword)
+/// 区分它们不能靠「看这个词像不像路径」（那要靠猜，还猜不准），而是靠**声明**：
+/// 表里写过它就归一化，没写过就原样传下去。于是「大小写不敏感」这件事
+/// 只需要一个依据、一趟归一化（见 [`execute`]），而不是每个分支各自去比。
+///
+/// ⚠️ 这张小表以**命令名**为钥匙，命令改名时它会悄悄飘掉 ——
+/// 测试 `every_declared_keyword_belongs_to_a_real_command` 守着。
+const KEYWORDS: &[(&str, &[&str])] = &[
+    // `all` = 整篇
+    ("delete", &["all"]),
+    ("copy", &["all"]),
+    // `config` 的三个子命令
+    ("config", &["path", "edit", "reload"]),
+    // `set` 的旋钮名
+    (
+        "set",
+        &[
+            "number",
+            "nonumber",
+            "tabwidth",
+            "scrolloff",
+            "sidescrolloff",
+            "lspmaxservers",
+        ],
+    ),
+];
+
+/// 这条命令声明了哪些关键字（没声明就是空）。
+fn declared_keywords(command: &str) -> &'static [&'static str] {
+    KEYWORDS
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, keywords)| *keywords)
+        .unwrap_or(&[])
 }
 
 /// 执行单条命令（[`lex`] 切出来的一段词）。
@@ -695,13 +773,31 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         return Err(format!("Unknown option: {}  ({})", flag.raw, spec.usage));
     }
 
-    // ③ 按「命令名 + 位置参数形状」匹配。选项在 ② 里已经验完，
-    //    所以这里只看位置参数 —— 它们是有形状的（几个、什么顺序）。
+    // ③ 归一化：把**声明过的关键字**折成表里那个写法（小写）。
     //
-    // ⚠️ 下面有一批 `if is_keyword(word, "…")` 的守卫。`match` 的模式是字面量，
-    //    没法写成「忽略大小写」，所以**关键字参数**只能改用守卫挑词；
-    //    命令名不用这么绕 —— 它在查表那一步就被 [`canonical`] 归一化了。
-    let args = command.args.as_slice();
+    // 之后下面每一个分支都是普通的字面量模式（`("delete", ["all"])`）——
+    // 大小写这件事在命令语言里只发生在**三个边界**上，各只做一次：
+    //
+    //   命令名 / 别名 → 查表时归一（[`canonical`]，认出就是表里那个名字）
+    //   选项名         → 解析时归一（[`parse_flag`]）
+    //   关键字参数     → 就是这里
+    //
+    // ⚠️ 折的**只有**表上声明过的词。别的词（路径、行号、正文）原样传下去 ——
+    //    所以 `:open README.MD` 里的 `README.MD` 一个字节都不会变；
+    //    而 `:open all` 里的 `all` 也不会被当成关键字（`open` 没声明它）。
+    let keywords = declared_keywords(command.name);
+    let args: Vec<&str> = command
+        .args
+        .iter()
+        .map(|&word| {
+            keywords
+                .iter()
+                .find(|keyword| keyword.eq_ignore_ascii_case(word))
+                .copied()
+                .unwrap_or(word)
+        })
+        .collect();
+    let args = args.as_slice();
     let force = command.force();
     match (command.name, args) {
         // ---- 退出与导航 ----
@@ -735,12 +831,12 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             app.set_status_message(format!("Config: {}", app.config.describe()));
             Ok(None)
         }
-        ("config", [word]) if is_keyword(word, "path") => {
+        ("config", ["path"]) => {
             report_config_path(app);
             Ok(None)
         }
-        ("config", [word]) if is_keyword(word, "edit") => open_settings(app, force),
-        ("config", [word]) if is_keyword(word, "reload") => Ok(Some(Action::ReloadConfig)),
+        ("config", ["edit"]) => open_settings(app, force),
+        ("config", ["reload"]) => Ok(Some(Action::ReloadConfig)),
 
         // ---- 后台任务 ----
         // **先把状态置上再返回 Action**：这样按下回车的那一帧就能看到
@@ -759,9 +855,10 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         // `delete` / `copy` 的第一个位置是**起点**、第二个是**终点**（都 1 基、含两端）。
         // `copy` 还多认 `行:列` 这种精确坐标 —— 位置参数只有「位置」一种概念，
         // 写 `行` 就是整行，写 `行:列` 就精确到列。一套语法，两种详略
-        ("delete", [word]) if is_keyword(word, "all") => {
-            let last = app.buffer.get_line_count().to_string();
-            delete_lines(app, "1", &last)?;
+        ("delete", ["all"]) => {
+            // 不再绕「拼一个字符串再解析回来」那道弯 —— 全篇就是第 0 行到最后一行
+            let last = app.buffer.get_line_count().saturating_sub(1);
+            delete_rows(app, 0, last)?;
             Ok(None)
         }
         ("delete", [one]) => {
@@ -772,9 +869,9 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             delete_lines(app, first, last)?;
             Ok(None)
         }
-        ("copy", [word]) if is_keyword(word, "all") => {
+        ("copy", ["all"]) => {
             let last = app.buffer.get_line_count().saturating_sub(1);
-            copy_range(app, (0, 0), (last, usize::MAX))
+            copy_rows(app, 0, last)
         }
         ("copy", [one]) => copy_positions(app, one, one),
         ("copy", [from, to]) => copy_positions(app, from, to),
@@ -797,27 +894,27 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
         }
 
         // ---- 设置 ----
-        ("set", [word]) if is_keyword(word, "number") => {
+        ("set", ["number"]) => {
             app.config.show_line_numbers = true;
             Ok(None)
         }
-        ("set", [word]) if is_keyword(word, "nonumber") => {
+        ("set", ["nonumber"]) => {
             app.config.show_line_numbers = false;
             Ok(None)
         }
-        ("set", [word, n]) if is_keyword(word, "tabwidth") => {
+        ("set", ["tabwidth", n]) => {
             set_tab_width(app, n)?;
             Ok(None)
         }
-        ("set", [word, n]) if is_keyword(word, "scrolloff") => {
+        ("set", ["scrolloff", n]) => {
             set_scroll_margin(app, n)?;
             Ok(None)
         }
-        ("set", [word, n]) if is_keyword(word, "sidescrolloff") => {
+        ("set", ["sidescrolloff", n]) => {
             set_side_scroll_margin(app, n)?;
             Ok(None)
         }
-        ("set", [word, n]) if is_keyword(word, "lspmaxservers") => {
+        ("set", ["lspmaxservers", n]) => {
             set_lsp_max_servers(app, n)?;
             Ok(None)
         }
@@ -1046,10 +1143,13 @@ fn report_config_path(app: &mut App) {
 
 // ---------- 编辑 ----------
 
-/// `delete <first> <last>`：删掉这些行（1 基，含两端；单行时 first == last）。
+/// `delete <first> <last>` 的**外壳**：把用户写的 1 基行号翻译成 0 基，
+/// 再交给 [`delete_rows`]。
 ///
-/// 内部用 `Buffer::delete_lines(start, count)` 一次删整段，
-/// 避免「删一行后下标前移」导致删错行。
+/// ⚠️ 「起 <= 止」的校验在这里，**不在 `delete_rows` 里** —— 因为按键那条路
+/// 根本走不到这个错（选区的最左端天然就是起点，`App::selection` 已经排好序了）。
+/// 与其在共用的实现里多一个永不触发的分支，不如把校验留在真正可能犯这个错的地方：
+/// **人在键盘上敲的数字**。
 fn delete_lines(app: &mut App, first_text: &str, last_text: &str) -> Result<(), String> {
     let (Some(first_row), Some(last_row)) = (
         parse_one_based_index(first_text),
@@ -1062,26 +1162,31 @@ fn delete_lines(app: &mut App, first_text: &str, last_text: &str) -> Result<(), 
         return Err(format!("{DELETE_USAGE}  (first must be <= last)"));
     }
 
-    let delete_count = last_row - first_row + 1; // 含两端
-    app.begin_undoable_command();
-    if !app.buffer.delete_lines(first_row, delete_count) {
-        // 越界：把 begin_undoable_command 存下的空步回滚掉，别留下「撤销了却没变」的坑
-        app.abort_undoable_command();
+    delete_rows(app, first_row, last_row)
+}
+
+/// 删掉第 `first` 到第 `last` 行（0 基、含两端），并写上回执。
+///
+/// ## 它是**唯一**的那份「删一段行」的实现
+///
+/// 行选择模式（`V`）里的 `Delete` / `d`，和命令 `:delete <起> <终>`、`:delete all`，
+/// 说的**是同一件事** —— 差别只在坐标是敲出来的还是从选区读出来的。
+/// 所以两边都走这里，连状态栏那句话都只有一份（`:delete 1 2` 和选区的 `Delete`
+/// 印出来的字一模一样）。
+///
+/// 真正动手的是 [`App::delete_row_range`]：记撤销步 + 删整段 + 同步 `dirty` 三合一。
+pub(crate) fn delete_rows(app: &mut App, first: usize, last: usize) -> Result<(), String> {
+    if !app.delete_row_range(first, last) {
         return Err(format!(
             "Line out of range: file has only {} lines",
             app.buffer.get_line_count()
         ));
     }
 
-    app.buffer.ensure_at_least_one_line(); // 删光后保留一个空行
-    if first_row == last_row {
-        app.set_status_message(format!("Deleted line {}", first_row + 1));
+    if first == last {
+        app.set_status_message(format!("Deleted line {}", first + 1));
     } else {
-        app.set_status_message(format!(
-            "Deleted lines {} to {}",
-            first_row + 1,
-            last_row + 1
-        ));
+        app.set_status_message(format!("Deleted lines {} to {}", first + 1, last + 1));
     }
     Ok(())
 }
@@ -1115,15 +1220,65 @@ fn parse_position(text: &str, is_end: bool) -> Option<(usize, usize)> {
     }
 }
 
-/// 取一段文本并包成 `Action::Copy`；坐标非法就说清楚为什么不行。
-fn copy_range(app: &App, start: (usize, usize), end: (usize, usize)) -> Executed {
-    match app.get_text_in_range(start, end) {
-        Some(text) => Ok(Some(Action::Copy(text))),
-        None => Err(format!(
+/// 取「第 first 行到第 last 行」的**整行**文本（0 基、含两端）。
+///
+/// 行首传第 0 列、行尾传 `usize::MAX`（会被夹到行末），所以「整行」这件事
+/// 不需要另写一套边界 —— 它和只写行号的 `:copy 1 3` 是同一条坐标。
+///
+/// 剪切那条路要的就是**文本本身**（得先拿出来才能删），所以它从这里取，
+/// 而不是从 [`copy_rows`] 返回的动作里再择出来。
+pub(crate) fn rows_text(app: &App, first: usize, last: usize) -> Result<String, String> {
+    range_text(app, (first, 0), (last, usize::MAX))
+}
+
+/// `:copy all` / 选区的 `y` 走这条：把「这几行」包成 [`Action::Copy`]。
+pub(crate) fn copy_rows(app: &App, first: usize, last: usize) -> Executed {
+    rows_text(app, first, last).map(|text| Some(Action::Copy(text)))
+}
+
+/// 把第 `first` 到第 `last` 行整体上移 / 下移一行，并写上回执。
+///
+/// **唯一**的「移行」实现：行选择模式里的 `h` / `l` 走它（将来真加 `:move` 命令，
+/// 也从这里出去 —— 一条逻辑一个入口）。
+///
+/// 真正动手的是 [`App::move_row_range`]：它是**用 swap 搭出来的**
+/// （一段 N 行的块挪一格 == N 次相邻交换），所以这里和 `:swap` 之间也没有
+/// 两套「换行」的实现。
+pub(crate) fn move_rows(app: &mut App, first: usize, last: usize, up: bool) -> Result<(), String> {
+    if !app.move_row_range(first, last, up) {
+        return Err(format!(
+            "Already at the {} of the file",
+            if up { "top" } else { "bottom" }
+        ));
+    }
+    // 回执只说**方向 + 行数**，不报行号：移完之后行号已经变了，
+    // 报改动前那个数只会让人对不上屏幕上的行号栏
+    let count = last - first + 1;
+    let direction = if up { "up" } else { "down" };
+    app.set_status_message(if count == 1 {
+        format!("Moved 1 line {direction}")
+    } else {
+        format!("Moved {count} lines {direction}")
+    });
+    Ok(())
+}
+
+/// 取一段文本（坐标同上），拿不到就说清楚为什么。
+///
+/// **唯一**的「区间 → 文本 + 报错」实现：行号式的 [`rows_text`]、带列的
+/// `:copy 2:3 5:7`，走的都是它。
+fn range_text(app: &App, start: (usize, usize), end: (usize, usize)) -> Result<String, String> {
+    app.get_text_in_range(start, end).ok_or_else(|| {
+        format!(
             "Range out of bounds or reversed (file has {} lines)",
             app.buffer.get_line_count()
-        )),
-    }
+        )
+    })
+}
+
+/// 取一段文本并包成 [`Action::Copy`]。
+fn copy_range(app: &App, start: (usize, usize), end: (usize, usize)) -> Executed {
+    range_text(app, start, end).map(|text| Some(Action::Copy(text)))
 }
 
 /// `swap <x> <y>`：交换两行。
@@ -1145,6 +1300,9 @@ fn swap_lines(app: &mut App, first_line_text: &str, second_line_text: &str) -> R
             app.buffer.get_line_count()
         ));
     }
+    // ⚠️ 这里直接动了 buffer，所以必须自己说一声「文档变了」——
+    //    `dirty` 是算出来的缓存，没人替我们刷新（同 `delete` 那个坑）
+    app.sync_dirty();
 
     app.set_status_message(format!(
         "Swapped lines {} and {}",
@@ -1382,6 +1540,45 @@ mod tests {
             run(&mut app, "WRITE Notes.TXT"),
             Some(Action::SaveAs("Notes.TXT".to_string()))
         );
+    }
+
+    #[test]
+    fn a_word_is_only_a_keyword_for_the_command_that_declared_it() {
+        // 「我们定的词」和「你写的字」在参数里长得一模一样，唯一的区别是
+        // **在不在那张表上**。`open` 没声明 `all`，所以那是个名字叫 ALL 的文件 ——
+        // 这条守着那层边界（哪天有人图省事把 `all` 加成全局关键字，这里会红）。
+        let mut app = app_with("a");
+        assert_eq!(
+            run(&mut app, "open ALL"),
+            Some(Action::OpenPath("ALL".to_string())),
+            "路径一个字节都不能被折掉"
+        );
+    }
+
+    #[test]
+    fn every_declared_keyword_belongs_to_a_real_command() {
+        // `KEYWORDS` 是以**命令名**为钥匙的第二张小表 —— 命令改名时它会悄悄飘掉。
+        // 顺手把「用法提示里得提到这个词」也一并盯上，表里打错字也会被抓住。
+        for (command, keywords) in KEYWORDS {
+            let Some(spec) = spec(command) else {
+                panic!("`{command}` 不在命令表里 —— 关键字表飘了");
+            };
+            for keyword in *keywords {
+                assert!(
+                    spec.usage.contains(keyword),
+                    "`{command}` 的用法提示里没有 `{keyword}`：要么表里打错了，要么提示忘了改"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_value_of_an_option_keeps_its_case() {
+        // 选项名折成小写，**值一个字节都不碰** —— 值可能是路径
+        let cmd = parse(r"set --Path=C:\Users\Me").unwrap();
+        assert_eq!(cmd.flags[0].name, "path");
+        assert_eq!(cmd.flags[0].value, Some(r"C:\Users\Me"));
+        assert_eq!(cmd.flags[0].raw, r"--Path=C:\Users\Me");
     }
 
     #[test]
@@ -1866,6 +2063,22 @@ mod tests {
             app.status_message
         );
         assert_eq!(app.buffer.get_line_count(), 2);
+    }
+
+    #[test]
+    fn command_edits_mark_the_document_dirty() {
+        // ⚠️ 这两个命令**曾经改了文档却不把 `dirty` 置起来**（`dirty` 是算出来的
+        // 缓存，谁直接动 buffer 谁就得自己说一声）—— 后果不是界面不好看，
+        // 而是 `:q` 不再拦你，几行改动直接就没了。这条守着这个不变量。
+        for line in ["delete 2", "swap 1 2"] {
+            let mut app = app_with("a\nb\nc");
+            assert!(!app.dirty, "起点得是干净的");
+            run(&mut app, line);
+            assert!(
+                app.dirty,
+                "`{line}` 改了文档，dirty 必须跟着起来（否则 `:q` 会放走没保存的改动）"
+            );
+        }
     }
 
     #[test]

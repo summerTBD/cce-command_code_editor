@@ -35,11 +35,26 @@ pub fn handle_key_event(
     view_height: usize,
     view_width: usize,
 ) -> Vec<Action> {
+    // ① 先把大小写折掉（只有该折的模式才折）
+    //
+    // 只读 / 行选择模式里**字母键不输入文本**，所以 `Y` 和 `y` 该是同一件事 ——
+    // 少按一次 Shift 的代价不该是「这个键没反应」。
+    //
+    // ⚠️ 另外三种模式里键**就是文本**，一个字节都不能折：
+    //    编辑模式（`A` 与 `a` 是两个字符）、命令模式与外部命令模式
+    //    （`:open README.MD` 的路径得原样进到输入行里 —— 命令名不挑大小写
+    //      是**命令层**的事，不该靠在按键层折字符来实现）。
+    let key = match app.mode {
+        EditorMode::ReadOnly | EditorMode::Visual => fold_letter_case(key),
+        EditorMode::Edit | EditorMode::Command | EditorMode::External => key,
+    };
+
     // 是否带了 Ctrl / Alt 修饰（Ctrl+q、Alt+i 这类组合，MVP 先一律忽略）
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl_alt = ctrl || alt;
-    // 只认「Ctrl + 单键」、不认 Alt 的撤销/重做快捷键
+    // 只认「Ctrl + 单键」、不认 Alt 的撤销/重做快捷键。
+    // 因为上面已经折过大小写，`Ctrl+Shift+R` 到这儿就是 `Ctrl+R`（修饰键也一起折了）
     let is_ctrl = |c: char| ctrl && !alt && key.code == KeyCode::Char(c);
 
     let mut actions: Vec<Action> = Vec::new();
@@ -61,15 +76,104 @@ pub fn handle_key_event(
                     KeyCode::Enter => actions.extend(open_entry_under_cursor(app)),
                     // u：撤销一步（类似 vim 的 normal 模式 u）
                     KeyCode::Char('u') => undo_or_report(app),
-                    // y：复制当前行到系统剪贴板（暂无选区模型，先做「整行复制」）
+                    // y：复制当前行到系统剪贴板（原来只有这一件事，现在它是
+                    // 「一行」的快捷写法；多行要先按 `V` 圈起来）
                     KeyCode::Char('y') => {
                         actions.push(Action::Copy(app.get_current_line_text()));
                     }
+                    // v：进入行选择模式 —— 之后 `y` / `d` / `Delete` 就作用在选区上。
+                    // 大写 `V` 也一样（字母键在只读/选择模式里不挑大小写，见 [`fold_letter_case`]）。
+                    KeyCode::Char('v') => app.enter_visual(),
                     // 移动：hjkl 或方向键
                     KeyCode::Char('h') | KeyCode::Left => app.move_cursor_by(0, -1),
                     KeyCode::Char('l') | KeyCode::Right => app.move_cursor_by(0, 1),
                     KeyCode::Char('j') | KeyCode::Down => app.move_cursor_by(1, 0),
                     KeyCode::Char('k') | KeyCode::Up => app.move_cursor_by(-1, 0),
+                    _ => {}
+                }
+            }
+        }
+
+        // ---------- 行选择模式：只动选区，不动文档 ----------
+        //
+        // 两类键：**拉选区**（`j`/`k`）和**对选区下的三个命令**（`y`/`d`/`Delete`）。
+        //
+        // ⚠️ 后面那三个**不另写实现**：「选区」只是一对**已知的行号**，
+        //    所以 `y` 走 [`commands::copy_rows`]、`Delete` 走 [`commands::delete_rows`] ——
+        //    和 `:copy 1 3` / `:delete 1 3` 是**同一份代码**。
+        //    一开始这里写过三个函数各干一遍（算坐标、取文本、删行），那是同一件事的
+        //    两套实现：改了一处忘了另一处，选区和命令就会慢慢长成两种行为。
+        EditorMode::Visual => {
+            if !ctrl_alt {
+                match key.code {
+                    // 拉选区：只动光标那一端，锚点（按下 `V` 的那一行）钉在原地。
+                    // **只有上下** —— 行选区没有左右可言（见 `app::EditorMode::Visual`）
+                    KeyCode::Char('j') | KeyCode::Down => app.move_cursor_by(1, 0),
+                    KeyCode::Char('k') | KeyCode::Up => app.move_cursor_by(-1, 0),
+                    // `y`：复制这几行 = `:copy <起> <终>`
+                    KeyCode::Char('y') => {
+                        if let Some((first, last)) = app.selection() {
+                            app.leave_visual();
+                            match commands::copy_rows(app, first, last) {
+                                Ok(action) => actions.extend(action),
+                                Err(message) => app.set_status_message(message),
+                            }
+                        }
+                    }
+                    // `Delete`：删这几行 = `:delete <起> <终>`（**不碰剪贴板**）
+                    KeyCode::Delete => {
+                        if let Some((first, last)) = app.selection() {
+                            app.leave_visual();
+                            if let Err(message) = commands::delete_rows(app, first, last) {
+                                app.set_status_message(message);
+                            }
+                        }
+                    }
+                    // 剪切 = 复制 + 删掉，**一次按键**（用户原话：这两个动作当一个使）。
+                    // 两半都走上面那两条现成的路；因为只有删那半改 buffer，
+                    // 整件事天然只占**一个撤销步** —— 一次 `u` 全回来。
+                    KeyCode::Char('d') => {
+                        if let Some((first, last)) = app.selection() {
+                            // ⚠️ 文本得在**删之前**取出来（删完就取不到了）
+                            let text = commands::rows_text(app, first, last);
+                            app.leave_visual();
+                            // 删那半写的回执（`Deleted lines 1 to 2`）在真机上会被
+                            // main 的 `Cut 2 lines to clipboard` 盖掉 —— 一条状态行
+                            // 只能有一个主人，而它是最后写的那一个。
+                            match commands::delete_rows(app, first, last) {
+                                // 删成了才把文本交出去：一半成的「剪切」不是剪切。
+                                // 回执归 main（剪贴板成没成只有它知道），这就是
+                                // [`Action::Cut`] 存在的全部理由
+                                Ok(()) => match text {
+                                    Ok(text) => actions.push(Action::Cut {
+                                        text,
+                                        rows: last - first + 1,
+                                    }),
+                                    Err(message) => app.set_status_message(message),
+                                },
+                                Err(message) => app.set_status_message(message),
+                            }
+                        }
+                    }
+                    // `h` / `l`：把这一段整体**下移 / 上移一行**（`h` 下、`l` 上）。
+                    // **不退出**选择模式 —— 连按几下就是一行一行地挪这一段。
+                    // 真正干活的是 [`commands::move_rows`]（而它底下是 `:swap`
+                    // 那套 swap 原语），命令层和这里没有两份实现。
+                    // ⚠️ 和只读模式的 `h` / `l`（左右）不同义：行选区没有左右可言。
+                    KeyCode::Char('h') | KeyCode::Char('l') => {
+                        let up = key.code == KeyCode::Char('l');
+                        if let Some((first, last)) = app.selection()
+                            && let Err(message) = commands::move_rows(app, first, last, up)
+                        {
+                            app.set_status_message(message);
+                        }
+                    }
+                    // Esc 退出；`v` 再按一下也退出（同一个键进、同一个键出）
+                    KeyCode::Esc | KeyCode::Char('v') => app.leave_visual(),
+                    // `:` 进命令模式。**选区会被丢掉**（`set_mode` 会清掉锚点）——
+                    // 我们不支持 `:'<,'>` 那种行范围前缀，留着选区却引用不了它，
+                    // 只会让人以为它还有用。
+                    KeyCode::Char(':') => app.enter_command_mode(),
                     _ => {}
                 }
             }
@@ -133,6 +237,35 @@ pub fn handle_key_event(
     actions
 }
 
+/// 把「Shift 出来的大写字母键」折成小写的那个键。
+///
+/// ## 为什么这里需要一层折叠
+///
+/// 只读 / 行选择模式里字母键**不输入文本**，所以 `Y` 和 `y` 本来就该是同一件事。
+/// 不做这一层的话，每个分支都得多写一遍 `Char('a') | Char('A')` ——
+/// 两个键还受得了，十几个就是纯噪音（而且新加一个键时很容易忘掉大写那一半）。
+///
+/// ## 折的是**键码**，不是文本
+///
+/// 折完之后这个键与「用户真的按了小写那个键」完全一样：`Char('Y')` → `Char('y')`。
+/// 修饰键里的 `SHIFT` 也一并去掉 —— 否则 `Ctrl+Shift+R` 会和 `Ctrl+R` 不一样，
+/// 而那正是这一层要消灭的差异（真机上大写字母是**带 SHIFT** 送来的，探针实测过）。
+///
+/// ⚠️ 非字母键（方向键、`Tab`、`Esc`、`:`…）原样返回 —— 它们本来就没有大小写。
+fn fold_letter_case(key: KeyEvent) -> KeyEvent {
+    let KeyCode::Char(letter) = key.code else {
+        return key;
+    };
+    if !letter.is_ascii_uppercase() {
+        return key;
+    }
+    KeyEvent {
+        code: KeyCode::Char(letter.to_ascii_lowercase()),
+        modifiers: key.modifiers - KeyModifiers::SHIFT,
+        ..key
+    }
+}
+
 /// 处理终端粘贴：bracketed paste 会把整段剪贴板文本聚合成**一个**
 /// `Event::Paste(String)`，内容就是这个 `text`。
 ///
@@ -150,6 +283,8 @@ pub fn handle_paste_event(app: &mut App, text: &str, view_height: usize, view_wi
             app.scroll_viewport_to_keep_cursor_visible(view_height, view_width);
         }
         EditorMode::ReadOnly => app.set_status_message("Read-only: press i to edit, then paste"),
+        // 选择模式里粘贴没有意义：粘贴是**改文档**，而这个模式一个键都不该改文档
+        EditorMode::Visual => app.set_status_message("Visual: Esc to leave, then i to edit"),
         // 底部那一行的粘贴暂时不做（两边一致）
         EditorMode::Command | EditorMode::External => {}
     }
@@ -302,7 +437,9 @@ fn open_entry_under_cursor(app: &mut App) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, handle_key_event, handle_mouse_event, handle_paste_event};
+    use super::{
+        Action, fold_letter_case, handle_key_event, handle_mouse_event, handle_paste_event,
+    };
     use crate::app::{App, Cursor, DocumentKind, EditorMode};
     use crate::config::DEFAULT_TAB_WIDTH;
     use crossterm::event::{
@@ -330,6 +467,16 @@ mod tests {
         }
     }
 
+    /// 模拟 Shift+键 —— 真机上大写字母就是**带 SHIFT** 送来的（按键探针实测过）
+    fn shifted(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
     /// 简化调用 handle（给一个固定的可视区尺寸）。
     ///
     /// 取**第一个**动作就够了：绝大多数测试只关心「这一下按键产出了什么」，
@@ -341,6 +488,19 @@ mod tests {
     /// 取按键产出的**全部**动作（命令模式的 `&&` 链会有多个）。
     fn run_all(app: &mut App, key: KeyEvent) -> Vec<Action> {
         handle_key_event(app, key, 10, 80)
+    }
+
+    /// 敲一整行命令（含开头那个 `:`），返回这一路上产出的所有动作。
+    ///
+    /// 用来把「按键那条路」和「命令那条路」摆在一起比对 —— 这是「同一份实现」
+    /// 这句话唯一能自动验证的形式。
+    fn type_command(app: &mut App, line: &str) -> Vec<Action> {
+        let mut actions = run_all(app, press(KeyCode::Char(':')));
+        for ch in line.chars() {
+            actions.extend(run_all(app, press(KeyCode::Char(ch))));
+        }
+        actions.extend(run_all(app, press(KeyCode::Enter)));
+        actions
     }
 
     /// 构造一个鼠标事件（行列坐标在滚轮测试里用不到）
@@ -461,6 +621,315 @@ mod tests {
         assert_eq!(app.cursor.col, 1);
         run(&mut app, press(KeyCode::Char('k')));
         assert_eq!(app.cursor.row, 0);
+    }
+
+    // ---------- 字母键不挑大小写（只读 / 行选择模式） ----------
+
+    #[test]
+    fn letter_keys_ignore_case_in_read_only_mode() {
+        // `Y` 和 `y` 是同一件事 —— 少按一次 Shift 不该变成「这个键没反应」。
+        // 两种送法都试：真机上是带 SHIFT 的（探针实测），但别指望它一定带
+        for key in [press(KeyCode::Char('Y')), shifted(KeyCode::Char('Y'))] {
+            let mut app = App::from_content(None, "a\nb".to_string());
+            assert_eq!(
+                run(&mut app, key),
+                Some(Action::Copy("a".to_string())),
+                "{key:?} 该等于 y"
+            );
+        }
+
+        // 移动、进编辑模式、进出选区同理
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        run(&mut app, shifted(KeyCode::Char('J')));
+        assert_eq!(app.cursor.row, 1, "`J` 该等于 j");
+        run(&mut app, shifted(KeyCode::Char('K')));
+        assert_eq!(app.cursor.row, 0, "`K` 该等于 k");
+        run(&mut app, shifted(KeyCode::Char('V')));
+        assert_eq!(app.mode, EditorMode::Visual, "`V` 该等于 v");
+        run(&mut app, shifted(KeyCode::Char('V')));
+        assert_eq!(app.mode, EditorMode::ReadOnly, "再按一下该退出");
+        run(&mut app, shifted(KeyCode::Char('I')));
+        assert_eq!(app.mode, EditorMode::Edit, "`I` 该等于 i");
+    }
+
+    #[test]
+    fn letter_keys_ignore_case_in_visual_mode() {
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        run(&mut app, press(KeyCode::Char('v')));
+        run(&mut app, shifted(KeyCode::Char('J'))); // `J` 该等于 j（拉大选区）
+        assert_eq!(app.selection(), Some((0, 1)));
+
+        run(&mut app, shifted(KeyCode::Char('H'))); // `H` 该等于 h（把这段下移）
+        assert_eq!(app.buffer.to_string(), "c\na\nb");
+        assert_eq!(app.selection(), Some((1, 2)), "选区跟着块走");
+
+        assert_eq!(
+            run(&mut app, shifted(KeyCode::Char('Y'))), // `Y` 该等于 y
+            Some(Action::Copy("a\nb".to_string()))
+        );
+        assert_eq!(app.mode, EditorMode::ReadOnly, "复制完退出选区");
+    }
+
+    #[test]
+    fn the_case_fold_never_touches_text() {
+        // 编辑模式里 `A` 和 `a` 是**两个字符**，折了就等于改了用户写的东西
+        let mut app = App::from_content(None, String::new());
+        run(&mut app, press(KeyCode::Char('i')));
+        run(&mut app, shifted(KeyCode::Char('A')));
+        assert_eq!(app.buffer.to_string(), "A");
+
+        // 命令行的路径得原样进去 —— 命令名不挑大小写是**命令层**的事，
+        // 不该靠在按键层折字符来实现
+        let mut app = App::new();
+        let actions = type_command(&mut app, "OPEN README.MD");
+        assert_eq!(actions, vec![Action::OpenPath("README.MD".to_string())]);
+
+        // `!` 那一行是 shell 的语言，大小写归它管
+        let mut app = App::new();
+        run(&mut app, press(KeyCode::Char('!')));
+        for ch in ['D', 'I', 'R'] {
+            run(&mut app, shifted(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            run(&mut app, press(KeyCode::Enter)),
+            Some(Action::RunExternal("DIR".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_fold_turns_a_shifted_letter_into_the_plain_one() {
+        // 修饰键里的 SHIFT 也要一并去掉 —— 否则 `Ctrl+Shift+R`
+        // 又会和 `Ctrl+R` 不一样，而它正是这一层要消灭的那种差异
+        let folded = fold_letter_case(shifted(KeyCode::Char('R')));
+        assert_eq!(folded.code, KeyCode::Char('r'));
+        assert!(folded.modifiers.is_empty(), "{:?}", folded.modifiers);
+
+        // 不是字母的键一个字节都不动（它们本来也没有大小写）
+        for code in [KeyCode::Up, KeyCode::Tab, KeyCode::Esc, KeyCode::Char(':')] {
+            assert_eq!(fold_letter_case(shifted(code)).code, code);
+        }
+    }
+
+    // ---------- 行选择模式（只读模式下按 `v`） ----------
+
+    #[test]
+    fn v_enters_visual_and_jk_extends_the_selection() {
+        let mut app = App::from_content(None, "a\nb\nc\nd".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        assert_eq!(app.mode, EditorMode::Visual);
+        assert_eq!(app.selection(), Some((0, 0)));
+
+        run(&mut app, press(KeyCode::Char('j')));
+        run(&mut app, press(KeyCode::Down));
+        assert_eq!(app.selection(), Some((0, 2)), "j 和 ↓ 是一回事");
+
+        run(&mut app, press(KeyCode::Char('k')));
+        assert_eq!(app.selection(), Some((0, 1)), "往上收");
+
+        // ⚠️ 扩缩选区**不该动文档** —— 这正是「上下扩选」和「上下移行」分开的理由
+        assert_eq!(app.buffer.to_string(), "a\nb\nc\nd");
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn j_alone_still_just_moves_the_cursor() {
+        // `V` 才是那个开关；普通的 j/k 还是移动，不该顺手圈出一行来
+        let mut app = App::from_content(None, "a\nb".to_string());
+        run(&mut app, press(KeyCode::Char('j')));
+        assert_eq!(app.selection(), None);
+        assert_eq!(app.cursor.row, 1);
+    }
+
+    #[test]
+    fn y_yanks_the_selected_lines_and_leaves_visual() {
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        run(&mut app, press(KeyCode::Char('j')));
+
+        assert_eq!(
+            run(&mut app, press(KeyCode::Char('y'))),
+            Some(Action::Copy("a\nb".to_string()))
+        );
+        assert_eq!(app.mode, EditorMode::ReadOnly, "复制完就退出选区（像 vim）");
+        assert_eq!(app.buffer.to_string(), "a\nb\nc");
+        assert!(!app.dirty, "复制不改文档");
+        // ⚠️ 状态行归 main 写（它才知道剪贴板成没成）—— 我们这里写什么都会被盖掉，
+        //    所以干脆什么都不写。手写一句「Yanked」看着很贴心，实际上是死代码。
+        assert!(app.status_message.is_empty(), "{}", app.status_message);
+    }
+
+    #[test]
+    fn d_cuts_the_selection_and_one_undo_brings_it_all_back() {
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        run(&mut app, press(KeyCode::Char('j')));
+
+        assert_eq!(
+            run(&mut app, press(KeyCode::Char('d'))),
+            Some(Action::Cut {
+                text: "a\nb".to_string(),
+                rows: 2,
+            }),
+            "剪切 = 复制 + 删，两半都得真的发生"
+        );
+        assert_eq!(app.buffer.to_string(), "c");
+        assert!(app.dirty);
+        assert_eq!(app.mode, EditorMode::ReadOnly);
+        // 删那半用的是命令层那句话（同一个函数写的）。真机上它会被 main 的
+        // `Cut 2 lines to clipboard` 盖掉（一条状态行一个主人）；
+        // 测试里没有 main，所以看得见的是这句中间态。
+        assert_eq!(app.status_message, "Deleted lines 1 to 2");
+
+        run(&mut app, press(KeyCode::Char('u')));
+        assert_eq!(
+            app.buffer.to_string(),
+            "a\nb\nc",
+            "剪掉的两行要能一次撤回来"
+        );
+    }
+
+    #[test]
+    fn the_delete_key_removes_without_touching_the_clipboard() {
+        let mut app = App::from_content(None, "a\nb\nc".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        run(&mut app, press(KeyCode::Char('j')));
+
+        assert_eq!(
+            run_all(&mut app, press(KeyCode::Delete)),
+            Vec::new(),
+            "只删不该产出写剪贴板的动作 —— 否则剪贴板里那点东西就被毁了"
+        );
+        assert_eq!(app.buffer.to_string(), "c");
+        assert!(app.dirty);
+        assert_eq!(app.mode, EditorMode::ReadOnly);
+        // 回执就是 `:delete 1 2` 那句原话 —— 因为是同一个函数写的
+        assert_eq!(app.status_message, "Deleted lines 1 to 2");
+    }
+
+    #[test]
+    fn the_visual_keys_take_the_very_same_route_as_the_commands() {
+        // 用户的原话：「选区就是坐标已知的 `copy x y` / `delete x y`」——
+        // 所以按键那条路和命令那条路必须给出**一模一样**的结果。
+        // 这条测试就是那句话的可执行版本：连状态栏那句回执都是同一个函数写的。
+        for command in ["copy 1 2", "delete 1 2"] {
+            let mut by_keys = App::from_content(None, "a\nb\nc\nd".to_string());
+            run(&mut by_keys, press(KeyCode::Char('V')));
+            run(&mut by_keys, press(KeyCode::Char('j')));
+            let key_actions = if command.starts_with("copy") {
+                run_all(&mut by_keys, press(KeyCode::Char('y')))
+            } else {
+                run_all(&mut by_keys, press(KeyCode::Delete))
+            };
+
+            let mut by_command = App::from_content(None, "a\nb\nc\nd".to_string());
+            let command_actions = type_command(&mut by_command, command);
+
+            assert_eq!(key_actions, command_actions, "`{command}` 与选区那个键");
+            assert_eq!(by_keys.buffer.to_string(), by_command.buffer.to_string());
+            assert_eq!(by_keys.status_message, by_command.status_message);
+            assert_eq!(by_keys.dirty, by_command.dirty);
+        }
+    }
+
+    #[test]
+    fn h_and_l_move_the_selected_block_and_keep_the_selection() {
+        let mut app = App::from_content(None, "a\nb\nc\nd".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        run(&mut app, press(KeyCode::Char('j'))); // 圈住 a、b（第 0-1 行）
+
+        run(&mut app, press(KeyCode::Char('h'))); // `h` = 下移一格
+        assert_eq!(app.buffer.to_string(), "c\na\nb\nd");
+        assert_eq!(app.mode, EditorMode::Visual, "移行不退出选择模式");
+        assert_eq!(app.selection(), Some((1, 2)), "选区跟着块一起走");
+        assert!(
+            app.status_message.contains("Moved 2 lines down"),
+            "{}",
+            app.status_message
+        );
+
+        // 连按第二下，挪的必须还是**同一段**（选区没跟上的话这里就换人了）
+        run(&mut app, press(KeyCode::Char('h')));
+        assert_eq!(app.buffer.to_string(), "c\nd\na\nb");
+        assert_eq!(app.selection(), Some((2, 3)));
+
+        run(&mut app, press(KeyCode::Char('l'))); // `l` = 上移回去
+        assert_eq!(app.buffer.to_string(), "c\na\nb\nd");
+        assert_eq!(app.selection(), Some((1, 2)));
+        assert!(
+            app.status_message.contains("Moved 2 lines up"),
+            "{}",
+            app.status_message
+        );
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn moving_stops_at_the_file_edges() {
+        let mut app = App::from_content(None, "a\nb".to_string());
+        run(&mut app, press(KeyCode::Char('V'))); // 选第 0 行
+        run(&mut app, press(KeyCode::Char('l'))); // `l` = 上移，可它已经在最上面
+
+        assert_eq!(app.buffer.to_string(), "a\nb", "最上面那行不能再上移");
+        assert!(
+            app.status_message.contains("Already at the top"),
+            "{}",
+            app.status_message
+        );
+        assert!(!app.dirty, "没挪动就不该变脏");
+        assert_eq!(app.mode, EditorMode::Visual, "失败也不该把人踢出选择模式");
+
+        // 下移那头（`h`）同理：把选区拉到最底下那一行，再往下就没有东西可换了
+        run(&mut app, press(KeyCode::Char('j')));
+        run(&mut app, press(KeyCode::Char('h')));
+        assert_eq!(app.buffer.to_string(), "a\nb");
+        assert!(
+            app.status_message.contains("Already at the bottom"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn escape_leaves_visual_and_so_does_a_second_v() {
+        // 进出都不挑大小写：`v` / `V` 都行（这一段没有字符级选择，两个键暂时同义）
+        for entry in [KeyCode::Char('v'), KeyCode::Char('V')] {
+            for exit in [KeyCode::Esc, KeyCode::Char('v'), KeyCode::Char('V')] {
+                let mut app = App::from_content(None, "a\nb".to_string());
+                run(&mut app, press(entry));
+                assert_eq!(app.mode, EditorMode::Visual, "{entry:?} 该能进");
+
+                run(&mut app, press(exit));
+                assert_eq!(app.mode, EditorMode::ReadOnly, "{entry:?} → {exit:?}");
+                assert_eq!(app.selection(), None);
+                assert_eq!(app.buffer.to_string(), "a\nb", "退出选区一个字都不该动");
+            }
+        }
+    }
+
+    #[test]
+    fn other_keys_in_visual_do_nothing_to_the_document() {
+        // 选不足模式里只有 j/k/y/d/Delete/Esc 和 `:` 是有意义的；别的键
+        // **什么都不做** —— 这句话正是这个模式存在的理由（否则你调选区时
+        // 会误改文件），所以专门钉一下。
+        let mut app = App::from_content(None, "a\nb".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        for code in [KeyCode::Char('x'), KeyCode::Char('w'), KeyCode::Char('i')] {
+            assert_eq!(run_all(&mut app, press(code)), Vec::new(), "{code:?}");
+        }
+        assert_eq!(app.mode, EditorMode::Visual);
+        assert_eq!(app.buffer.to_string(), "a\nb");
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn an_unbound_command_mode_entry_from_visual_drops_the_selection() {
+        // 在选区里按 `:` 进命令模式：选区会被丢掉 —— 我们不支持 `:'<,'>`
+        // 那种行范围前缀，留着选区却引用不了它，只会让人以为它还有用
+        let mut app = App::from_content(None, "a\nb".to_string());
+        run(&mut app, press(KeyCode::Char('V')));
+        run(&mut app, press(KeyCode::Char(':')));
+        assert_eq!(app.mode, EditorMode::Command);
+        assert_eq!(app.selection(), None);
     }
 
     // ---------- 编辑模式 ----------

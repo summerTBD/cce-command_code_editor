@@ -104,6 +104,10 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
     let inner_area = area;
     let visible_height = inner_area.height as usize;
 
+    // 选区（只在行选择模式下有值）。**提到循环外面算一次** ——
+    // 它在整个循环里是个常量，放进去就成了「每画一行重算一遍」。
+    let selection = app.selection();
+
     // 逐行构建内容：只取「视口内可见的行」，并裁掉左侧被横向滚动走的部分
     let mut rendered_lines: Vec<Line> = Vec::with_capacity(visible_height);
     for line_index in 0..visible_height {
@@ -125,9 +129,17 @@ fn render_text_area(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // 正文用配置里的颜色；当前行再叠一层很淡的背景色，方便定位
+        // 正文用配置里的颜色；背景按**优先级**叠一层：
+        //
+        // 选区 > 当前行。理由：选区里**每一行**都得能认出来（它就是待会儿要
+        // 复制/删掉的那几行），而光标停在哪一头由终端自己的光标标着。
+        // 反过来（当前行盖住选区）会让选区的那一头看着像「没选中」。
         let mut line_style = Style::default().fg(colors.text);
-        if file_row == app.cursor.row {
+        if let Some((first, last)) = selection {
+            if (first..=last).contains(&file_row) {
+                line_style = line_style.bg(colors.selection_bg);
+            }
+        } else if file_row == app.cursor.row {
             line_style = line_style.bg(colors.current_line_bg);
         }
         spans.push(Span::styled(visible_text, line_style));
@@ -242,12 +254,17 @@ fn render_mode_hint(frame: &mut Frame, app: &App, area: Rect) {
         EditorMode::ReadOnly => (
             "-- READ-ONLY --",
             Style::default().fg(colors.mode_readonly),
-            "q back/quit | : command | ! shell | i edit | u undo | y copy line",
+            "q back/quit | : command | ! shell | i edit | u undo | y copy line | v select",
         ),
         EditorMode::Edit => (
             "-- EDIT --",
             Style::default().fg(colors.mode_edit),
             "Esc read-only | type to edit | ^Z undo | ^Y redo",
+        ),
+        EditorMode::Visual => (
+            "-- VISUAL --",
+            Style::default().fg(colors.mode_visual),
+            "j/k extend | h/l move | y copy | d cut | Del delete | Esc cancel",
         ),
         // 底部在收集输入的那两种模式，这一行由 [`render_input_prompt`] 接管。
         // 这里直接返回而不是 `unreachable!()`：渲染路径上不该有任何 panic ——
@@ -362,6 +379,32 @@ mod tests {
 
         // 光标当前行会叠一层背景色
         assert_eq!(buffer[(2, 0)].bg, Colors::default().current_line_bg);
+    }
+
+    /// 选区的那几行盖的是**选区色**，并且和「当前行」那个底色分得开
+    #[test]
+    fn the_visual_selection_paints_its_own_background() {
+        let mut app = App::from_content(None, "one\ntwo\nthree".to_string());
+        app.enter_visual();
+        app.move_cursor_by(1, 0); // 圈住第 0、1 行
+
+        let buffer = render_frame(&app, 20, 6);
+
+        // 行号 1 格 + 空格 1 格，所以正文从第 2 列起
+        for row in [0, 1] {
+            assert_eq!(
+                buffer[(2, row)].bg,
+                Colors::default().selection_bg,
+                "第 {row} 行应该在选区里"
+            );
+        }
+        assert_ne!(
+            Colors::default().selection_bg,
+            Colors::default().current_line_bg,
+            "两个底色不能撞上 —— 撞上了就分不出「光标在哪」和「圈了哪几行」"
+        );
+        // 没被圈住的那一行不该有底色（第 2 行既不在选区里，也不是光标行）
+        assert_eq!(buffer[(2, 2)].bg, Color::Reset);
     }
 
     /// 改了配置之后，屏幕上应该跟着变
