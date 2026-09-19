@@ -1007,13 +1007,26 @@ impl App {
         }
     }
 
-    /// Enter：在光标处断行，光标移到新行开头
+    /// Enter：在光标处断行，光标移到新行开头（第 0 列）。
+    ///
+    /// ## ⚠️ 这里**不做任何缩进预测**（2026-09-19 用户拍板）
+    ///
+    /// 新行就是空行，缩进全归用户自己打。
+    ///
+    /// 曾经按 VS Code 的档位做过「继承上一行缩进 / 开括号多进一级 / 闭括号退一级」，
+    /// 试完被撤了。不是实现的问题，是**这个位置拿不到判断所需的信息**：
+    /// 终端把手按的回车和粘贴内容里的换行送成**同一个** `KeyCode::Enter`
+    /// （Windows 上 `Event::Paste` 根本不会到，详见 `event.rs`），
+    /// 于是「这段文字是我打的还是粘的」永远只能猜。猜错的代价是
+    /// 用户打的缩进和猜的缩进叠在一起 —— 比不猜糟得多。
+    ///
+    /// 现在只有**用户明确按下的键**会改变缩进：Tab 键插 `config.tab_width` 个空格
+    /// （见 `update.rs`），其余时候我们一个空格都不加。
     pub fn split_line_at_cursor(&mut self) {
         self.record_standalone_edit();
         self.buffer.split_line_at(self.cursor.row, self.cursor.col);
         self.cursor.row += 1;
-        // 新行已经带有继承来的缩进，光标应放在缩进之后。
-        self.cursor.col = self.buffer.get_leading_indent_char_count(self.cursor.row);
+        self.cursor.col = 0;
         self.sync_dirty();
     }
 
@@ -1025,6 +1038,11 @@ impl App {
     ///
     /// 这里刻意复用 `insert_char_at_cursor` / `split_line_at_cursor`，让粘贴走和手输完全相同的
     /// 代码路径（多字节字符、dirty 标记、光标推进都自动一致）。
+    ///
+    /// ✅ 复用 `split_line_at_cursor` 现在是**安全**的：它只断行、不猜缩进，
+    /// 所以粘进来的每行的前导空白就是它自己的，不会被加上第二层。
+    /// ⚠️ 这条前提是一道**暗门**：哪天又给 Enter 加回自动缩进，粘贴就会双缩进，
+    /// 而在 Windows 上**没有一个测试拦得住** —— 测试能造出 `Event::Paste`，真终端不能。
     ///
     /// 撤销方面：**整段粘贴只占一个撤销步**。做法是先存一份「粘贴前」的快照，
     /// 再临时锁住历史记录（`history_locked`），让内部逐字插入不再各自记步。
@@ -1109,24 +1127,34 @@ mod tests {
     use crate::diagnostic::Severity;
 
     #[test]
-    fn enter_inherits_indent_and_places_cursor_after_it() {
+    fn enter_never_guesses_the_indent() {
         let mut app = App::from_content(None, "    int a;".to_string());
         app.set_mode(EditorMode::Edit);
         app.cursor = Cursor { row: 0, col: 10 };
         app.split_line_at_cursor();
-        assert_eq!(app.buffer.get_line(1).as_deref(), Some("    "));
-        assert_eq!(app.cursor, Cursor { row: 1, col: 4 });
+        assert_eq!(
+            app.buffer.get_line(1).as_deref(),
+            Some(""),
+            "新行必须是空的"
+        );
+        assert_eq!(app.cursor, Cursor { row: 1, col: 0 });
         app.insert_char_at_cursor('x');
-        assert_eq!(app.buffer.get_line(1).as_deref(), Some("    x"));
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("x"));
     }
 
+    /// 光标落在缩进**里面**时回车 —— 这里正是「阶梯」那个 bug 的现场。
+    ///
+    /// 老实现的公式是「整行缩进 + 光标右边那段」，而光标右边那段的**开头就是缩进本身**，
+    /// 同一段空白被算两遍（4 个空格变 8 个），于是一层层往右爬。
+    /// 现在不猜了，那段空白原样退到下一行，一个字符都不多。
     #[test]
-    fn enter_preserves_tab_indent() {
-        let mut app = App::from_content(None, "\tvalue".to_string());
-        app.cursor = Cursor { row: 0, col: 6 };
+    fn enter_inside_the_indent_adds_nothing() {
+        let mut app = App::from_content(None, "    int a;".to_string());
+        app.cursor = Cursor { row: 0, col: 0 };
         app.split_line_at_cursor();
-        assert_eq!(app.buffer.get_line(1).as_deref(), Some("\t"));
-        assert_eq!(app.cursor.col, 1);
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some(""));
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("    int a;"));
+        assert_eq!(app.cursor, Cursor { row: 1, col: 0 });
     }
 
     #[test]

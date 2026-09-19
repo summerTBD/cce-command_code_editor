@@ -213,20 +213,6 @@ impl Buffer {
         }
     }
 
-    /// 返回第 row 行开头的原始缩进文本，保留空格/Tab 形式。
-    fn get_leading_indent(&self, row: usize) -> String {
-        self.line_chars(row)
-            .take_while(|ch| ch.is_whitespace())
-            .collect()
-    }
-
-    /// 第 row 行开头有多少个缩进字符（供 Enter 断行后放光标用）
-    pub(crate) fn get_leading_indent_char_count(&self, row: usize) -> usize {
-        self.line_chars(row)
-            .take_while(|ch| ch.is_whitespace())
-            .count()
-    }
-
     // ---------- 显示列换算（按需扫描：rope 不管终端宽度） ----------
 
     /// 第 row 行前 col 个字符对应的显示列。
@@ -447,8 +433,16 @@ impl Buffer {
         }
     }
 
-    /// 在第 row 行的第 col 个字符处断行（Enter）：右侧内容成为新的一行，
-    /// 并继承当前行的前导缩进。
+    /// 在第 row 行的第 col 个字符处断行（Enter）：右侧内容成为新的一行。
+    ///
+    /// ## ⚠️ 新行**不带任何缩进**
+    ///
+    /// 这里曾经会继承当前行的前导缩进（`get_leading_indent`），现在一个字都不加：
+    /// 缩进全归用户自己打。理由见 `App::split_line_at_cursor` —— 简单说，
+    /// 换行这个位置分不出「手按的回车」和「粘贴里的换行」，所以只能猜；
+    /// 而猜错的代价（用户打的缩进和猜的叠在一起）比不猜高得多。
+    ///
+    /// 注意这是**原语**：它只负责断行，不认识「Enter 这个按键」的任何语义。
     pub fn split_line_at(&mut self, row: usize, col: usize) {
         if row >= self.get_line_count() {
             return;
@@ -456,13 +450,12 @@ impl Buffer {
         let col = col.min(self.get_char_count(row));
         let start = self.line_content_start(row);
         let content_len = self.get_char_count(row);
-        let indent = self.get_leading_indent(row);
         let rest: String = self.line_chars(row).skip(col).collect();
 
-        // 把行内容里 [col, 末尾) 这一段换成「换行 + 缩进 + 右半段」。
+        // 把行内容里 [col, 末尾) 这一段换成「换行 + 右半段」。
         // 行尾原有的换行符不在这个区间里，所以会留在新行的末尾，位置正确。
         self.rope.remove(start + col..start + content_len);
-        self.rope.insert(start + col, &format!("\n{indent}{rest}"));
+        self.rope.insert(start + col, &format!("\n{rest}"));
 
         // 先把新行的格子数插进列表，再重算 row：
         // 万一 row 变窄触发了重扫，此刻新行已经在列表里，不会漏算。
@@ -607,7 +600,7 @@ mod tests {
 
     #[test]
     fn max_cell_count_cache_tracks_split() {
-        // 在最宽行中间断行：左边变短、右边带缩进，最大值要重新算准
+        // 在最宽行中间断行：左边变短，最大值要重新算准
         let mut b = Buffer::from_str("aa\nbbbbbb");
         b.split_line_at(1, 3);
         assert_eq!(b.get_line(1).as_deref(), Some("bbb"));
@@ -615,12 +608,14 @@ mod tests {
         assert_eq!(b.get_max_cell_count(), 3);
         assert_consistent(&b);
 
-        // 在行首断行时新行会继承缩进，长度可能超过原行
+        // 在行首断行：新行是**空的**，原来的缩进留在原处不动
+        // （以前这里会继承缩进 → 新行比原行还长，是「阶梯」那个 bug 的现场）
         let mut b = Buffer::from_str("    abc");
         b.split_line_at(0, 0);
         assert_eq!(b.get_line(0).as_deref(), Some(""));
-        assert_eq!(b.get_line(1).as_deref(), Some("        abc"));
-        assert_eq!(b.get_max_cell_count(), 11);
+        assert_eq!(b.get_line(1).as_deref(), Some("    abc"));
+        assert_eq!(b.get_max_cell_count(), 7);
+        assert_consistent(&b);
     }
 
     #[test]

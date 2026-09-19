@@ -1027,6 +1027,43 @@ mod tests {
         assert_eq!(app.cursor.col, 0);
     }
 
+    /// **用户自己打的缩进原样落地** —— 编辑器一个空格都不加、也不减。
+    ///
+    /// 这条按键级测试同时钉住两件事，缺一不可：
+    /// 1. Enter 之后光标在**第 0 列**（不是「继承来的缩进的末尾」）；
+    /// 2. 空格键就是一个普通字符。
+    ///
+    /// 只要第 1 条被破坏（哪天又给 Enter 加回自动缩进），下面这 4 个空格就会叠在
+    /// 编辑器猜的那层上 —— 那条路径在 Windows 上没法用真粘贴验证（`Event::Paste`
+    /// 根本不会到），所以**这个测试是唯一的拦网**。
+    #[test]
+    fn a_hand_typed_indent_lands_verbatim() {
+        let mut app = App::from_content(None, "    int a;".to_string());
+        app.set_mode(EditorMode::Edit);
+        app.cursor = Cursor { row: 0, col: 10 }; // 行尾
+
+        run(&mut app, press(KeyCode::Enter));
+        assert_eq!(
+            app.buffer.get_line(1).as_deref(),
+            Some(""),
+            "新行必须是空的"
+        );
+        assert_eq!(app.cursor, Cursor { row: 1, col: 0 }, "光标必须落在第 0 列");
+
+        for _ in 0..4 {
+            run(&mut app, press(KeyCode::Char(' ')));
+        }
+        run(&mut app, press(KeyCode::Char('i')));
+
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("    i"));
+        assert_eq!(app.cursor.col, 5);
+        assert_eq!(
+            app.buffer.get_line(0).as_deref(),
+            Some("    int a;"),
+            "上一行不动"
+        );
+    }
+
     // ---------- 外部命令模式（`!` 让位） ----------
 
     #[test]
