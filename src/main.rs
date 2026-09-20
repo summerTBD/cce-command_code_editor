@@ -37,8 +37,9 @@ use stbd::lsp;
 use stbd::lsp::pool::Pool;
 use stbd::lsp::session::{Outcome, Session};
 use stbd::outbox::{OutFile, Outbox};
+use stbd::tools::{check, formatter};
 use stbd::update;
-use stbd::{background, check, config, event, file_io, formatter, ui};
+use stbd::{background, config, event, file_io, ui};
 
 /// 我们用到的终端后端类型（Crossterm 输出到 stdout）
 type Backend = CrosstermBackend<io::Stdout>;

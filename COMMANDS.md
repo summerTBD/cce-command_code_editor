@@ -502,7 +502,7 @@ clang-format 那批后缀是跟配置里 `[lsp.c]` / `[lsp.cpp]` **对齐**的�
 **不会**先闪一下「Formatting…」再改口。
 
 > ⚠️ **那道门是刻意留的**：命令层里**不许**出现 `if 语言 == "rust" { 跑 cargo fmt }`，
-> 而是去 `src/formatter.rs` 的表里查。将来能不能接第三个（gofmt、prettier……），
+> 而是去 `tools/formatter.rs` 的表里查。将来能不能接第三个（gofmt、prettier……），
 > 只由这一处决定。（VS Code 的内置扩展走的是跟第三方**完全同一套**机制 ——
 > 那才是「可扩展」的实质，不是多建一个文件夹。）
 

@@ -1,4 +1,4 @@
-//! 后台跑 `cargo check` —— check.rs 的职责
+//! 后台跑 `cargo check` —— `tools/check.rs` 的职责
 //!
 //! 这是项目里**第一个后台任务**，所以这个文件的意义不止于「跑一次 cargo」——
 //! 它把后面 LSP 要用的四件事全练了一遍：

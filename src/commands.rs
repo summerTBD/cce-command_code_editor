@@ -61,8 +61,8 @@ use std::borrow::Cow;
 
 use crate::app::{App, DocumentKind, EditorMode};
 use crate::config::Config;
-use crate::formatter;
 use crate::outbox::OutFile;
+use crate::tools::formatter;
 
 /// **update**（按键或命令）要 main.rs 去做的「副作用」。
 ///

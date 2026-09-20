@@ -257,6 +257,16 @@ pub fn run(provider: &Provider, text: &str, context: &Context) -> Result<String,
     //
     //    只归一 `\r\n`，不动孤立的 `\r` —— 那是另一个东西（老 Mac 的行尾，
     //    或者正文里真有一个回车字符），擅自改它反而更像自作主张。
+    //
+    // ⚠️ **这里还欠一条守卫**（2026-09-20 定：先不做，留个标记）——
+    //    「扫一遍 `src/**/*.rs` 看有没有 `\r`」。
+    //
+    //    起因：新写的 `background.rs` 整个是 CRLF，而**三样东西都看不出来**：
+    //    `cargo fmt --check` 抓不到（rustfmt 检查时不管行尾）、`git status`
+    //    看不出来（`.gitattributes` 是 `eol=lf`，提交那一刻才归一化）、
+    //    屏幕上也没区别 —— 只有真跑一次 `:fmt`，它才会报「有改动」露出来。
+    //
+    //    真要加的话加在 `tests/` 里就成：一条扫全仓库的测试，读字节看有没有 `13`。
     Ok(formatted.replace("\r\n", "\n"))
 }
 

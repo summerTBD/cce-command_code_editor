@@ -1,16 +1,15 @@
 pub mod app;
 pub mod background;
 pub mod buffer;
-pub mod check;
 pub mod commands;
 pub mod config;
 pub mod diagnostic;
 pub mod documents;
 pub mod event;
 pub mod file_io;
-pub mod formatter;
 pub mod lsp;
 pub mod outbox;
+pub mod tools;
 pub mod ui;
 pub mod undo;
 pub mod update;

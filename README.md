@@ -204,7 +204,7 @@ extensions = ["zig"]
   **一个撤销步**，`u` 就退回去。别的后缀会说 `No formatter for this file type`
 
 > `:fmt` 是项目里**第一个「提供者」**：命令层不写 `if 语言 == "rust"`，而是去
-> `src/formatter.rs` 的一张表里按后缀查。加第三个（gofmt、prettier……）只需要
+> `tools/formatter.rs` 的一张表里按后缀查。加第三个（gofmt、prettier……）只需要
 > 往那张表加一条 + 写一个算 argv 的函数。
 >
 > ⚠️ clang-format 那条路会**认项目里的 `.clang-format`**（`-style=file`）——
