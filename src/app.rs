@@ -200,6 +200,13 @@ pub struct App {
     /// 理由跟 `run_action` 不拿 `&mut Terminal` 一样：`App` 一旦持有活着的东西，
     /// `App::new()` 就不再是纯内存对象，那一整套测试全得陪葬。
     pub checking: bool,
+    /// 是否有 `:fmt` 正在后台跑。
+    ///
+    /// 跟 `checking` **一模一样**的立场：只记「有没有」，不持有那个通道。
+    /// 为什么这条纪律要紧，见上面 `checking` 那段 —— 总之 `App` 一旦拿着
+    /// 活着的东西（进程、线程、通道），`App::new()` 就不再是纯内存对象，
+    /// 那一整套测试全得陪葬。
+    pub formatting: bool,
     /// 服务器推来的、**当前这个文件**的诊断。
     ///
     /// 跟 `checking` 同一个立场：只存**数据**，不存客户端。
@@ -287,6 +294,7 @@ impl App {
             documents: DocumentList::new(),
             kind: DocumentKind::default(),
             checking: false,
+            formatting: false,
             diagnostics: Vec::new(),
             history: UndoStack::new(DEFAULT_UNDO_LIMIT),
             history_locked: false,
@@ -340,6 +348,35 @@ impl App {
         self.history.reset();
         self.history_locked = false;
         self.sync_dirty();
+    }
+
+    /// 用**同一份文档**的新文本整体换掉内容（`:fmt` 用）。
+    ///
+    /// ## ⚠️ 跟 [`App::replace_document`] 是两件事，别混
+    ///
+    /// | | 说的是什么 | 撤销历史 | 光标 |
+    /// |---|---|---|---|
+    /// | `replace_document` | 换成**另一份**文档了 | 清空 | 归零 |
+    /// | `replace_all_text` | 还是**这一份**，只是被重排过 | **留着** | 尽量不动 |
+    ///
+    /// 格式化**必须**能按 `u` 撤回来。清掉撤销栈就等于「`:fmt` 一次，
+    /// 之前所有的编辑全锁死」—— 而排版是**可以有主观看法的**（长表达式怎么折、
+    /// 换行放哪），用户不满意时必须能一键退回去。
+    ///
+    /// 返回**是否真的改了**。一个字都没变时**不记撤销步**：否则连敲两次
+    /// `:fmt` 会留下一个「撤了也没变化」的空步，用户得按两次 `u`
+    /// 才能退掉一次真正的编辑。
+    pub fn replace_all_text(&mut self, text: &str) -> bool {
+        // 比的是**内容**，不是 `Buffer` 的指针 —— `Buffer::from_str` 每次都造新的
+        if self.buffer.to_string() == text {
+            return false;
+        }
+        self.record_standalone_edit();
+        self.buffer = Buffer::from_str(text);
+        // 排版会改行数（长表达式折开、空行合并），光标可能落到文件外面
+        self.clamp_cursor_to_buffer();
+        self.sync_dirty();
+        true
     }
 
     // ---------- 虚拟视图（`:errors` / `:ls`） ----------
@@ -897,6 +934,17 @@ impl App {
             | DocumentKind::DocumentList
             | DocumentKind::LspStatus => Path::new(path)
                 .parent()
+                // ⚠️ 空串要当成「没有」，不能当真目录交给调用方。
+                //
+                //    原因：`Path::new("x.c").parent()` 给的是 `Some("")` **不是**
+                //    `None`。当「拼相对路径的基准」用时它恰好无害
+                //    （`"".join("a.rs")` = `"a.rs"`，和退回进程 cwd 一个效果），
+                //    但它作为一个**目录答案**是假的 —— 而一旦有人拿它去
+                //    `Command::current_dir`，子进程根本起不来
+                //    （Windows: os error 123「文件名、目录名或卷标语法不正确」）。
+                //    这个 bug 是 `:fmt` 第一版炸出来的：拿相对名字打开文件时
+                //    `Format: FAILED — cannot run clang-format: ... (os error 123)`。
+                .filter(|dir| !dir.as_os_str().is_empty())
                 .map(|dir| dir.display().to_string()),
         }
     }
@@ -1401,6 +1449,59 @@ mod tests {
         assert_eq!(app.buffer.get_line_count(), 1);
         assert_eq!(app.buffer.get_line(0).as_deref(), Some(""));
         assert!(!app.undo());
+    }
+
+    /// 外部提供者送回来的整份新文本，走的是[`App::replace_all_text`]。
+    ///
+    /// ⚠️ 这一条盯的是它跟 `replace_document` 的**分界**：那个换的是**另一份文档**
+    /// （清撤销栈、光标归零），这个换的是**同一份文档的内容**。
+    /// 混成一个的话，`:fmt` 一次就会把你之前所有的编辑全锁死 ——
+    /// 而排版是可以有主观看法的（长表达式怎么折、换行放哪），
+    /// 用户不满意时**必须**能一键退回去。
+    #[test]
+    fn replace_all_text_is_one_undo_step() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "fn a(){let x=1;}".to_string());
+
+        assert!(app.replace_all_text("fn a() {\n    let x = 1;\n}\n"));
+
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("fn a() {"));
+        assert_eq!(app.buffer.get_line(1).as_deref(), Some("    let x = 1;"));
+        assert_eq!(app.buffer.get_line(2).as_deref(), Some("}"));
+        assert!(
+            app.dirty,
+            "内容变了就必须是脏的，否则 :q 不拦你，改动直接没"
+        );
+
+        assert!(app.undo(), "排版必须能一步撤回");
+        assert_eq!(app.buffer.get_line(0).as_deref(), Some("fn a(){let x=1;}"));
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn replace_all_text_with_the_same_content_is_not_an_edit() {
+        let mut app = App::from_content(None, "fn a() {}\n".to_string());
+        assert!(!app.replace_all_text("fn a() {}\n"), "一个字没变就不算改过");
+
+        // ⚠️ 没变的时候**不许**留下撤销步：留了的话，连敲两次 `:fmt` 之后
+        //    要按两次 `u` 才能退掉一次真正的编辑（第一次按下去像卡住了）。
+        //    这是 `replace_all_text` 自己返回值、而不是让调用方去比的原因。
+        assert!(!app.undo(), "不该有可撤销的东西");
+    }
+
+    #[test]
+    fn replace_all_text_never_leaves_the_cursor_outside_the_file() {
+        // 排版会改行数（长表达式折开、空行合并）。光标要是留在第 5 行
+        // 而新内容只剩 2 行，它就落到文件外面了 —— 下一次按键会写错地方。
+        let mut app = App::from_content(None, "a\nb\nc\nd\ne".to_string());
+        app.cursor = Cursor { row: 4, col: 1 };
+
+        app.replace_all_text("a\nb");
+
+        assert!(
+            app.cursor.row < app.buffer.get_line_count(),
+            "光标跑到文件外面了"
+        );
+        assert!(app.cursor.col <= app.buffer.get_char_count(app.cursor.row));
     }
 
     #[test]

@@ -199,6 +199,16 @@ extensions = ["zig"]
 
 - `:check` - 在后台跑 `cargo check`，**界面不卡**。回车那一刻状态栏就显示 `Checking…`，
   跑完把 cargo 自己的那句总结报出来（成功是 `Finished …`，失败是 `error: could not compile …`）
+- `:fmt` - 在后台跑格式化工具（`rustfmt` 认 `.rs`，`clang-format` 认 C/C++ 那一批后缀），
+  **排的是缓冲区里那份、不碰磁盘**，所以没保存的改动不会被丢掉。结果换回来只占
+  **一个撤销步**，`u` 就退回去。别的后缀会说 `No formatter for this file type`
+
+> `:fmt` 是项目里**第一个「提供者」**：命令层不写 `if 语言 == "rust"`，而是去
+> `src/formatter.rs` 的一张表里按后缀查。加第三个（gofmt、prettier……）只需要
+> 往那张表加一条 + 写一个算 argv 的函数。
+>
+> ⚠️ clang-format 那条路会**认项目里的 `.clang-format`**（`-style=file`）——
+> 这跟它在命令行上的默认行为不一样，命令行下不给参数它用的是内置 LLVM style。
 
 **选项**
 

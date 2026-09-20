@@ -38,7 +38,7 @@ use stbd::lsp::pool::Pool;
 use stbd::lsp::session::{Outcome, Session};
 use stbd::outbox::{OutFile, Outbox};
 use stbd::update;
-use stbd::{check, config, event, file_io, ui};
+use stbd::{background, check, config, event, file_io, formatter, ui};
 
 /// 我们用到的终端后端类型（Crossterm 输出到 stdout）
 type Backend = CrosstermBackend<io::Stdout>;
@@ -142,7 +142,13 @@ const TICK: Duration = Duration::from_millis(50);
 fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
     // 正在跑的后台检查。放在主循环的局部变量里而不是 `App` 里 ——
     // 理由见 `App::checking` 的注释：App 只记「有没有」，不持有通道。
-    let mut check: Option<mpsc::Receiver<check::CheckReport>> = None;
+    let mut check: Option<background::Worker<check::CheckReport>> = None;
+
+    // 正在跑的格式化。
+    //
+    // 跟 `check` **一模一样**的立场：通道是「活着的东西」，所以住在主循环里；
+    // `App` 只记「有没有」（`app.formatting`）。理由见 `App::checking` 的注释。
+    let mut format: Option<background::Worker<formatter::Report>> = None;
 
     // 语言服务器。跟 `check` 完全同一个立场：它是**活的东西**（一个进程、
     // 两根管道、两个线程），所以住在主循环里，不进 `App`。
@@ -199,11 +205,17 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
                             }
                             // 让位：终端暂时交出去，回来之后界面还是原样
                             Step::HandOver(line) => run_external_command(terminal, app, &line),
-                            Step::StartCheck => check = start_check(app),
+                            Step::StartCheck => {
+                                check = start_check(app).map(background::Worker::new);
+                            }
+                            // 格式化是**同一个形状**，所以直接套同一个收件端
+                            Step::StartFormat => {
+                                format = start_format(app).map(background::Worker::new);
+                            }
                             // 正文在这里拼（要池子），拼完铺上去、再拄进输出文件夹 ——
                             // 和 `:ls` / `:errors` 一样：**屏幕上显示的就是拄出去的那份**
                             Step::ShowLspStatus => {
-                                let text = lsp_status(&app.config, &lsp.running());
+                                let text = app.config.lsp_status(&lsp.running());
                                 app.show_list(DocumentKind::LspStatus, text);
                                 write_outbox(app, OutFile::LspStatus);
                             }
@@ -237,36 +249,71 @@ fn run_event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
         // 收服务器这一轮说的话（非阻塞，没话说就立刻回来）
         drain_lsp(&mut lsp, app, &mut redraw);
 
-        // 把后台攒下的消息**一口气全取走**。
+        // 收两个后台任务这一轮攒下的消息。
         //
-        // ⚠️ 是「全取走」而不是「取一条」：任务慢了我们也不该越落越远，
-        //    取干净之后手上的状态永远是最新那一份。
-        if let Some(rx) = &check {
-            // 一口气全取走（`while`）而不是取一条：后台攒了几条就消化几条，
-            // 落后的永远只有「当前这一轮」。现在只会收到一条，但形状先立对 ——
-            // LSP 那一步消息是连绵不断的。
-            let mut finished = false;
-            while let Ok(report) = rx.try_recv() {
-                app.set_status_message(report.describe());
-                finished = true;
+        // ⚠️ 那段容易拿捏错的判断（「一口气全取走」和「`Disconnected` 不等于
+        //    `Empty`」）在 `background::Worker` 里，**只有一份**，而且有测试盯着。
+        //    这里只管「拿到的消息怎么处理」。
+        //
+        //    以前这段在主循环里被写了两遍（第二份是照着第一份抄的），
+        //    而主循环测不了（要一个真终端）—— 所以那两条判断**一直没被任何测试
+        //    盯过**。现在它们有了。
+        //
+        // ⚠️ 先 `map` 出结果再 `match`：借用在那一步就结束了，
+        //    因此下面收工时可以放心把 `check` / `format` 整个丢掉。
+        match check.as_mut().map(background::Worker::poll) {
+            None | Some(background::Progress::Quiet) => {}
+            Some(background::Progress::Reports { reports, over }) => {
+                for report in &reports {
+                    app.set_status_message(report.describe());
+                }
+                redraw = true;
+                // ⚠️ 只有 `over` 才能清标记、丢通道。**半路的消息不该顺手把任务
+                //    标记成结束** —— 那会让后面还会说话的任务提前失去听众，
+                //    而且它是静默的（消息发过来没人接，`send` 报错但没人看）。
+                if over {
+                    app.checking = false;
+                    check = None;
+                }
             }
-
-            // ⚠️ `Disconnected` 必须和 `Empty` 分开看：前者是「发送端没了」
-            //    （正常发完就结束，或者线程 panic 了），后者是「暂时没消息」。
-            //    混为一谈的话，「任务悄悄死了」就永远发现不了，
-            //    状态栏会永远停在「Checking…」。
-            //
-            //    上面那个 `while` 已经排空了队列，所以这里返回 Disconnected
-            //    就是真的结束了 —— 而 `finished` 为真时我们已经做过汇报，
-            //    不能再补一句「线程死了」把好消息盖掉。
-            if !finished && matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+            Some(background::Progress::DiedBeforeSpeaking) => {
+                // 必须说出来，否则状态栏永远停在「Checking…」
                 app.set_status_message("Check: the worker thread died".to_string());
-                finished = true;
-            }
-
-            if finished {
                 app.checking = false;
                 check = None;
+                redraw = true;
+            }
+        }
+
+        match format.as_mut().map(background::Worker::poll) {
+            None | Some(background::Progress::Quiet) => {}
+            Some(background::Progress::Reports { reports, over }) => {
+                for report in &reports {
+                    app.set_status_message(report.describe());
+
+                    // ⚠️ `changed` 是**在后台线程上**算的（拿它手上那份原文比），
+                    //    不能在这儿比：用户可能在你排版这两秒里又敲了几个字，
+                    //    拿现在的缓冲区去比，比出来的是错的答案。
+                    if let Ok(text) = &report.outcome
+                        && report.changed
+                    {
+                        app.replace_all_text(text);
+                        // 排版会改行数，视口可能落到内容外面 ——
+                        // 那种画面看上去像「文件被清空了」，而它其实好好的
+                        let (view_h, view_w) = compute_view_size(app);
+                        app.clamp_viewport_to_content(view_h, view_w);
+                    }
+                }
+                redraw = true;
+                if over {
+                    app.formatting = false;
+                    format = None;
+                }
+            }
+            Some(background::Progress::DiedBeforeSpeaking) => {
+                app.set_status_message("Format: the worker thread died".to_string());
+                app.formatting = false;
+                format = None;
                 redraw = true;
             }
         }
@@ -291,6 +338,33 @@ fn start_check(app: &mut App) -> Option<mpsc::Receiver<check::CheckReport>> {
             None
         }
     }
+}
+
+/// 起一次后台格式化，返回新的收件通道。
+///
+/// ⚠️ 送到提供者手上的正文是 `app.buffer.to_string()` —— **缓冲区里那份**，
+/// 不是磁盘上那份。这是整个功能最重要的一条：盘上那份可能改过但没存，
+/// 拿它去排版再换回来，用户刚敲的东西就没了。
+///
+/// （命令层已经挑过一次提供者，这里是第二道；真到了这里还没有，
+/// 说明缓冲区状态变了 —— 比如你自己刚把文件另存成了 `.txt`。
+/// 跟 `start_check` 一个立场：报一句，**不往上抛**。）
+fn start_format(app: &mut App) -> Option<mpsc::Receiver<formatter::Report>> {
+    let Some(provider) = formatter::provider_for(app.file_path.as_deref()) else {
+        app.set_status_message("No formatter for this file type".to_string());
+        app.formatting = false;
+        return None;
+    };
+
+    let text = app.buffer.to_string();
+    let context = formatter::Context {
+        dir: app.current_directory(),
+        // ⚠️ 路径也得给它：clang-format 靠它认语言（`.c` / `.cpp`）
+        //    和找项目里的 `.clang-format`。走 stdin 就把这个名字抹掉了，
+        //    所以要由我们**还回去** —— 跟 rustfmt 要 `--edition` 同一个道理。
+        path: app.file_path.clone(),
+    };
+    Some(formatter::spawn(provider, text, context))
 }
 
 // ---------- 语言服务器 ----------
@@ -605,6 +679,10 @@ enum Step {
     /// 同样得回主循环才能做：起线程、拿收件通道、以后每轮去 `try_recv` ——
     /// 这些都是「活着的东西」，不该让 [`run_action`] 碰。
     StartCheck,
+    /// 起一次后台格式化（`:fmt`）。
+    ///
+    /// 跟 [`Step::StartCheck`] 是同一个理由：线程 + 通道是活着的东西。
+    StartFormat,
     /// 铺一份「语言服务器现在什么状况」的清单（`:lsp`）。
     ///
     /// 同样得回主循环：那份清单要说「现在跑着哪几个」，只有池子知道。
@@ -646,6 +724,8 @@ fn run_action(app: &mut App, action: Action) -> Step {
         Action::RunExternal(line) => return Step::HandOver(line),
         // 需要起线程 / 留通道，同样交回主循环
         Action::RunCheck => return Step::StartCheck,
+        // 同上 —— 格式化不碰终端，但它要起线程、留通道
+        Action::Format => return Step::StartFormat,
         // 正文要池子（「现在跑着哪几个」），交回主循环
         Action::ShowLspStatus => return Step::ShowLspStatus,
         // 纯状态：把虚拟视图退掉，原来那份文档原样放回来（不需要读盘）
@@ -674,105 +754,6 @@ fn write_outbox(app: &mut App, file: OutFile) {
     if let Err(err) = Outbox::locate().write(file, &text) {
         app.set_status_message(format!("Cannot write {} ({err})", file.name()));
     }
-}
-
-/// `:lsp` 那一屏 —— 「配了哪些语言服务器、命令找不找得到、现在跑着几个」。
-///
-/// ## 为什么它值得一条命令
-///
-/// 语言服务器是**外部程序**：编辑器不带、也不会替你装。于是最常出现的两个
-/// 问题正好相反 —— 「我都没下载，它怎么跑起来的」和「我明明装了，怎么不动」。
-///
-/// 在这之前，屏幕上**没有任何地方**能看出配了什么、找不找得到：唯一那句话是
-/// 状态栏的 `LSP: clangd is ready`，而它只在**成功之后**才出现。失败的时候
-/// 你看到的是一模一样的安静 —— 和「这个文件恰好没问题」长得完全一样。
-///
-/// ## ⚠️ 底下那条「找不到」不代表你没装
-///
-/// 我们只认 `PATH` 上的命令。VS Code 扩展**打包在里面**的那些服务器
-/// （pyright、jdtls……）不在 `PATH` 上，我们也看不见 ——
-/// 「装了扩展」和「我们找得到」是两件不相干的事。这个区别正是那句话的来源，
-/// 所以表里写的是 **on PATH**，不是笼统的「找不到」。
-///
-/// 拆成纯函数（只要配置和「现在跑着哪几个」这两样**数据**，不要 `App`、
-/// 不要池子、不要真服务器）是为了能测：它说的每句话在 `main.rs` 的测试里
-/// 都能被钉住 —— 连「有几个在跑」那一支也能，因为那一支要的东西
-/// 恰好就是 `Pool::running()` 的返回值。
-fn lsp_status(config: &config::Config, running: &[(String, String)]) -> String {
-    let mut lines = vec![
-        format!(
-            "{} server(s) configured, {} running, limit {}",
-            config.lsp.len(),
-            running.len(),
-            config.lsp_max_servers
-        ),
-        String::new(),
-    ];
-
-    // ⚠️ 按节名排一遍。`HashMap` 的顺序是随机的 —— 不排的话同一台机器上
-    //    每敲一次 `:lsp` 行序都不一样，你会以为配置变了。
-    let mut named: Vec<(&String, &config::LspServer)> = config.lsp.iter().collect();
-    named.sort_by_key(|(name, _)| name.as_str());
-
-    for (name, server) in named {
-        lines.push(format!(
-            "{name}  [{}]  ->  {}",
-            server.extensions.join(" "),
-            if server.command.is_empty() {
-                "(off)"
-            } else {
-                server.command.as_str()
-            }
-        ));
-
-        if server.command.is_empty() {
-            // `command = ""` 就是「把这条关掉」—— 正是「为什么没反应」的答案之一，
-            // 所以要说出来，不能只是一片空白
-            lines.push("    off: this section's command is empty".to_string());
-            continue;
-        }
-
-        match config::which(&server.command) {
-            // ⚠️ **文件名在前、目录在下一行。**
-            //
-            // 一条路径被右边切掉时，先没的是**尾巴**，而尾巴恰恰是唯一
-            // 能认出「这是哪一个」的那一段（两条 `clangd` 的目录可能长得
-            // 几乎一样，区别只在最后）。实测过：一行到底的写法在 78 列的
-            // 终端里两条都显示成 `...clang+llvm-22.1.8-...` —— 表格看着
-            // 很整齐，但一点用都没有。
-            //
-            // 拆开之后，被切掉的只会是目录里最不重要的尾部。
-            Some(path) => {
-                lines.push(format!(
-                    "    ok  {}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-                if let Some(dir) = path.parent() {
-                    lines.push(format!("        {}", dir.display()));
-                }
-            }
-            // ⚠️ 这句话是**故意**写全的：只说「找不到」会让人去查 PATH 之外的东西
-            //    （比如「我扩展装了呀」）。把判据说出来，用户才知道该去改什么。
-            None => lines.push(format!(
-                "    NOT on PATH -- the editor still works, but {} gets no diagnostics",
-                server.extensions.join("/")
-            )),
-        }
-    }
-
-    lines.push(String::new());
-    if running.is_empty() {
-        // ⚠️ 空不等于「坏了」：服务器是**用到了才起**的，而且只在真文件上起 ——
-        //    所以停在目录列表里、或者这门语言的文件还没打开过，本来就该是空的。
-        lines.push("running now: none (servers start when a matching file is opened)".to_string());
-    } else {
-        lines.push(format!("running now ({})", running.len()));
-        for (command, root) in running {
-            lines.push(format!("    {command}  @  {root}"));
-        }
-    }
-
-    lines.join("\n")
 }
 
 /// 把编辑器要的终端状态装回去（[`release_terminal`] 的逆操作），
@@ -1103,165 +1084,6 @@ mod tests {
         assert_eq!(project_root_of(&file, Some("build.gradle")), None);
 
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    // ---------- `:lsp` 那一屏 ----------
-
-    /// 造一份只含一条的配置，命令指哪儿由调用方说了算。
-    fn config_with(command: &str, extensions: &[&str]) -> config::Config {
-        let mut config = config::Config::default();
-        config.lsp.clear();
-        config.lsp.insert(
-            "zz".to_string(),
-            config::LspServer {
-                name: "zz".to_string(),
-                command: command.to_string(),
-                args: Vec::new(),
-                extensions: extensions.iter().map(|e| e.to_string()).collect(),
-                root_marker: None,
-                language_id: None,
-            },
-        );
-        config
-    }
-
-    /// 找得到的命令要报出**它的文件名和目录** —— 那是这张表的主要用处。
-    ///
-    /// ⚠️ 用**自己造的**绝对路径，不用 `clangd` / `rust-analyzer` 这种真名字：
-    /// 那样这条测试就变成了「这台机器装没装 clangd」，换台机器就红，
-    /// 而它要验的其实是「我们会不会把找到的位置说出来」。
-    /// （命令里带路径分隔符时不去翻 `PATH`，所以这条路是确定的。）
-    ///
-    /// ⚠️ 断言分成**两段**（文件名、目录）是刻意的 —— 它们**必须分两行**。
-    /// 一条到底的写法在窄终端里会被右边切掉，先没的正好是文件名，
-    /// 而那是唯一能认出「这是哪一个」的地方。
-    #[test]
-    fn the_lsp_list_says_where_the_command_was_found() {
-        let dir = std::env::temp_dir().join("stbd-lsp-status");
-        std::fs::create_dir_all(&dir).expect("建临时目录");
-        let program = dir.join("my-server.exe");
-        std::fs::write(&program, "假装是个程序").expect("写临时文件");
-
-        let config = config_with(&program.to_string_lossy(), &["zz"]);
-        let text = lsp_status(&config, &[]);
-
-        assert!(text.contains("zz"), "要列出节名和它管的扩展名：{text}");
-
-        // ⚠️ 盯的是 `ok` 那一行，**不是**「哪一行里出现了文件名」——
-        //    表头那行印的是**配置里原样写的**命令，而这里的命令本身就是
-        //    一条路径，于是文件名在表头里也出现了一次。找第一处会找错行
-        //    （第一版就是这么红的）。
-        let lines: Vec<&str> = text.lines().collect();
-        let ok_at = lines
-            .iter()
-            .position(|line| line.trim_start().starts_with("ok"))
-            .unwrap_or_else(|| panic!("该报「找得到」：{text}"));
-        assert!(
-            lines[ok_at].contains("my-server.exe"),
-            "要找得到就说清**是哪一个** —— 文件名得在这一行：{text}"
-        );
-        // 紧接着的下一行是目录 —— 而不是把整条路径挤在同一行里
-        assert_eq!(
-            lines.get(ok_at + 1).map(|line| line.trim()),
-            Some(dir.to_string_lossy().as_ref()),
-            "文件名之后该跟一行目录：{text}"
-        );
-        // 表头那行该是**配置里原样写的**东西：查「我改的配置生效了吗」全靠它
-        assert!(
-            lines[2].contains(&program.to_string_lossy().to_string()),
-            "表头该原样印出配置里写的命令：{text}"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// 找不到的命令要说 **on PATH** 这个词。
-    ///
-    /// 为什么非要这两个字：用户看到「找不到」的第一反应是「可我扩展装了呀」——
-    /// 而 VS Code 扩展打包在里面的服务器（pyright、jdtls）本来就不在 `PATH` 上。
-    /// 把判据说出来，他才知道该去改什么；只说「找不到」等于让他去查一个
-    /// 我们根本没看过的地方。
-    #[test]
-    fn a_missing_command_is_blamed_on_path_specifically() {
-        let config = config_with("definitely-not-a-real-program-9527", &["zz"]);
-        let text = lsp_status(&config, &[]);
-
-        assert!(text.contains("PATH"), "要把判据说出来：{text}");
-        assert!(
-            text.contains("zz"),
-            "要说清「是哪门语言没诊断」——不然不知道影响的是什么：{text}"
-        );
-    }
-
-    /// `command = ""` = 这一条关掉了。清单必须**说出来**，不能只是一片空白。
-    ///
-    /// 它是「为什么这个文件没反应」的两个答案之一（另一个是没装/不在 PATH）。
-    /// 留白的话，用户手上就只剩「我明明写了配置呀」这一个线索。
-    #[test]
-    fn an_empty_command_is_reported_as_switched_off() {
-        let config = config_with("", &["zz"]);
-        let text = lsp_status(&config, &[]);
-
-        assert!(text.contains("off"), "{text}");
-        // 关掉的条目**不该**顺带说一句「找不到」—— 那会把人往错的方向指
-        assert!(!text.contains("PATH"), "关掉不是「找不到」：{text}");
-    }
-
-    /// 「现在跑着几个」那一行：空的时候要说清**为什么**空。
-    ///
-    /// ⚠️ 空 ≠ 坏了：服务器是**用到了才起**的，而且只在真文件上起 ——
-    /// 停在目录列表里、或者这门语言的文件还没打开过，本来就该是空的。
-    /// 不说这句的话，「none」看起来就是「它没在工作」。
-    #[test]
-    fn an_empty_pool_says_none_but_explains_why() {
-        let text = lsp_status(&config_with("", &["zz"]), &[]);
-
-        assert!(text.contains("none"), "{text}");
-        assert!(
-            text.contains("opened"),
-            "要说清「不是坏了，是还没打开这种文件」：{text}"
-        );
-    }
-
-    /// 有会话在跑时，要把**命令**和**是哪个项目**都列出来。
-    #[test]
-    fn a_running_server_is_listed_with_its_project() {
-        let running = vec![
-            ("clangd".to_string(), "file:///D:/a".to_string()),
-            ("rust-analyzer".to_string(), "file:///D:/b".to_string()),
-        ];
-        let text = lsp_status(&config_with("", &["zz"]), &running);
-
-        assert!(text.contains("running now (2)"), "{text}");
-        assert!(text.contains("clangd"), "{text}");
-        assert!(text.contains("file:///D:/a"), "要说清是哪个项目：{text}");
-        assert!(text.contains("rust-analyzer"), "{text}");
-    }
-
-    /// ⚠️ 节名要**排过序**。`HashMap` 的遍历顺序是随机的 ——
-    /// 不排的话同一份配置每敲一次 `:lsp` 行序都不一样，
-    /// 而「行序莫名其妙在变」会让人以为自己改动了什么。
-    #[test]
-    fn the_lsp_list_is_sorted_and_never_changes_order() {
-        let config = config::Config::default();
-        let first = lsp_status(&config, &[]);
-        for _ in 0..20 {
-            assert_eq!(
-                lsp_status(&config, &[]),
-                first,
-                "同一份配置不该给出两种行序"
-            );
-        }
-
-        // 而且顺序**确实**是按名字来的（不是碰巧稳定）
-        let order: Vec<&str> = first
-            .lines()
-            .filter(|line| line.starts_with(['c', 'r']))
-            .collect();
-        assert_eq!(
-            order.first().map(|l| l.split_whitespace().next()),
-            Some(Some("c"))
-        );
     }
 
     /// 尺寸换算要跟 ui.rs 的布局对齐：高 = 行数 − 2，宽 = 列数 − 行号栏

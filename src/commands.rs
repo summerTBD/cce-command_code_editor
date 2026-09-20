@@ -61,6 +61,7 @@ use std::borrow::Cow;
 
 use crate::app::{App, DocumentKind, EditorMode};
 use crate::config::Config;
+use crate::formatter;
 use crate::outbox::OutFile;
 
 /// **update**（按键或命令）要 main.rs 去做的「副作用」。
@@ -121,6 +122,15 @@ pub enum Action {
     /// 等你敲回车；这个一个字都不往终端写，你继续编辑，结果到了才报。
     /// main 负责：起线程 + 留一个收件通道（见 `check::spawn`）。
     RunCheck,
+    /// 在后台跑一次格式化（`:fmt`）。
+    ///
+    /// ⚠️ 跟 [`Action::RunCheck`] 是**同一个形状**（后台线程 + 通道，结果到了才报），
+    /// 但它排版的是**缓冲区里那份**，不是磁盘上那份 —— 所以它一个字都不许写盘。
+    /// 理由见 `formatter` 模块顶上那段（盘上那份可能已经是旧的）。
+    ///
+    /// 挑哪个工具、怎么喂文本、结果怎么换回来，**全在 `formatter` 里**，
+    /// 这里一个字的判断都没有 —— 那就是「提供者」那道门。
+    Format,
     /// 从虚拟视图（`:errors`）退回原来那份文档。
     ///
     /// ⚠️ 它**不是** [`Action::OpenPath`] —— 那个会去磁盘上重新读一遍，
@@ -154,6 +164,8 @@ const NEXT_USAGE: &str = "Usage: next [--force]";
 const LS_USAGE: &str = "Usage: ls";
 const FORGET_USAGE: &str = "Usage: forget <n>  (n comes from :ls)";
 const CHECK_USAGE: &str = "Usage: check";
+
+const FORMAT_USAGE: &str = "Usage: format";
 const ERRORS_USAGE: &str = "Usage: errors";
 const LSP_USAGE: &str = "Usage: lsp";
 const OPEN_USAGE: &str = "Usage: open <path> [--force]";
@@ -269,6 +281,16 @@ const COMMANDS: &[Spec] = &[
         // （现在 `:errors` 加进来了，它也没有别名 —— vim 里 `:e` 是 `:edit`。）
         aliases: &[],
         usage: CHECK_USAGE,
+        force: false,
+    },
+    Spec {
+        name: "format",
+        // `:fmt` 才是大家会敲的那个（`gofmt` / `rustfmt` / VS Code 的 Format 都这么叫），
+        // 所以它必须有；规范名叫 `format` 是为了跟别的命令一样是完整的词
+        aliases: &["fmt"],
+        usage: FORMAT_USAGE,
+        // 不需要 `--force`：它确实会**改正文**，但那个改动能一个 `u` 退掉，
+        // 而且不碰磁盘。`--force` 是为了「会弄丢东西」那些命令准备的
         force: false,
     },
     // ---- 诊断 ----
@@ -849,6 +871,23 @@ fn execute(app: &mut App, words: &[&str]) -> Executed {
             app.checking = true;
             app.set_status_message("Checking…");
             Ok(Some(Action::RunCheck))
+        }
+        // 格式化：跟 `:check` 同一个形状 —— **先把状态置上再返回 Action**，
+        // 让「Formatting…」在按下回车那一帧就出现，而不是等结果回来。
+        //
+        // ⚠️ 这里先挑一次提供者（纯查表，不碰任何活着的东西）：挑不到就**当场**说，
+        //    不必先闪一下「Formatting…」再改口。main 那边还会再挑一次 —— 它自己
+        //    本来就要那个提供者，多查一次纯函数比把 `&'static` 塞进 `Action` 便宜。
+        ("format", []) => {
+            if app.formatting {
+                return Err("Already formatting".to_string());
+            }
+            if formatter::provider_for(app.file_path.as_deref()).is_none() {
+                return Err("No formatter for this file type".to_string());
+            }
+            app.formatting = true;
+            app.set_status_message("Formatting…");
+            Ok(Some(Action::Format))
         }
 
         // ---- 编辑 ----
@@ -1795,6 +1834,48 @@ mod tests {
         );
     }
 
+    /// `:fmt` 的三条性质跟 `:check` 一一对应（立刻给反馈 / 挡住第二次 / 挡下时不产 Action）。
+    ///
+    /// ⚠️ 但多一条 `:check` 没有的：**挑不到提供者就当场拒绝**。
+    /// `cargo check` 对任何 Rust 项目都存在，而 `rustfmt` 只对 `.rs` 有意义 ——
+    /// 对一个 `.txt` 先闪一下「Formatting…」再说「没这个格式的工具」，
+    /// 读起来像是先答应了再反悔。
+    #[test]
+    fn format_starts_a_background_task_and_refuses_a_second_one() {
+        let mut app = App::from_content(Some("a.rs".to_string()), "fn a(){}".to_string());
+        assert!(!app.formatting);
+
+        assert_eq!(run(&mut app, "format"), Some(Action::Format));
+        assert!(app.formatting, "得把状态置上，界面才知道该显示 Formatting…");
+        assert!(
+            app.status_message.contains("Formatting"),
+            "{}",
+            app.status_message
+        );
+
+        // 第二次：拒绝，并且不该再产出 Action
+        assert_eq!(run(&mut app, "fmt"), None, "`:fmt` 是别名，走的是同一条");
+        assert!(
+            app.status_message.contains("Already formatting"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn format_says_no_right_away_for_a_file_type_nobody_handles() {
+        let mut app = App::from_content(Some("notes.txt".to_string()), "hello".to_string());
+
+        assert_eq!(run(&mut app, "fmt"), None);
+        assert!(
+            app.status_message.contains("No formatter"),
+            "{}",
+            app.status_message
+        );
+        // ⚠️ 状态**不该**被置上：任务根本没起，界面不能显示「在跑」
+        assert!(!app.formatting);
+    }
+
     // ---------- 命令表本身 ----------
 
     #[test]
@@ -1817,6 +1898,7 @@ mod tests {
             "config edit",
             "config reload",
             "check",
+            "format",
             "delete 1",
             "copy 1",
             "swap 1 2",

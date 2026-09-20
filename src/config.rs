@@ -802,6 +802,114 @@ impl Config {
         )
     }
 
+    /// `:lsp` 那一屏 —— 「配了哪些语言服务器、命令找不找得到、现在跑着几个」。
+    ///
+    /// ## 为什么它值得一条命令
+    ///
+    /// 语言服务器是**外部程序**：编辑器不带、也不会替你装。于是最常出现的两个
+    /// 问题正好相反 —— 「我都没下载，它怎么跑起来的」和「我明明装了，怎么不动」。
+    ///
+    /// 在这之前，屏幕上**没有任何地方**能看出配了什么、找不找得到：唯一那句话是
+    /// 状态栏的 `LSP: clangd is ready`，而它只在**成功之后**才出现。失败的时候
+    /// 你看到的是一模一样的安静 —— 和「这个文件恰好没问题」长得完全一样。
+    ///
+    /// ## ⚠️ 底下那条「找不到」不代表你没装
+    ///
+    /// 我们只认 `PATH` 上的命令。VS Code 扩展**打包在里面**的那些服务器
+    /// （pyright、jdtls……）不在 `PATH` 上，我们也看不见 ——
+    /// 「装了扩展」和「我们找得到」是两件不相干的事。这个区别正是那句话的来源，
+    /// 所以表里写的是 **on PATH**，不是笼统的「找不到」。
+    ///
+    /// ## ⚠️ 它为什么住在这儿，而不是 `main.rs`
+    ///
+    /// 它曾经在 `main.rs` 里。搬过来是因为：它只吃两样**数据**
+    /// （`&Config` + `Pool::running()` 的返回值），却要读 `[lsp.*]` 表、
+    /// `lsp_max_servers` 和 `which` —— 那三样**全是这个模块的东西**。
+    /// 放在别人家里，「`[lsp.*]` 这一节是什么意思」就分散到两个文件去了。
+    ///
+    /// 顺带：`main.rs` 的职责是「执行副作用」，而**拼一份给人看的报告不是副作用**。
+    ///
+    /// `running` 收的是**数据**而不是池子（就是 `Pool::running()` 的返回值），
+    /// 所以这一屏能被测试钉住 —— 连「有几个在跑」那一支也能。
+    pub fn lsp_status(&self, running: &[(String, String)]) -> String {
+        let mut lines = vec![
+            format!(
+                "{} server(s) configured, {} running, limit {}",
+                self.lsp.len(),
+                running.len(),
+                self.lsp_max_servers
+            ),
+            String::new(),
+        ];
+
+        // ⚠️ 按节名排一遍。`HashMap` 的顺序是随机的 —— 不排的话同一台机器上
+        //    每敲一次 `:lsp` 行序都不一样，你会以为配置变了。
+        let mut named: Vec<(&String, &LspServer)> = self.lsp.iter().collect();
+        named.sort_by_key(|(name, _)| name.as_str());
+
+        for (name, server) in named {
+            lines.push(format!(
+                "{name}  [{}]  ->  {}",
+                server.extensions.join(" "),
+                if server.command.is_empty() {
+                    "(off)"
+                } else {
+                    server.command.as_str()
+                }
+            ));
+
+            if server.command.is_empty() {
+                // `command = ""` 就是「把这条关掉」—— 正是「为什么没反应」的答案之一，
+                // 所以要说出来，不能只是一片空白
+                lines.push("    off: this section's command is empty".to_string());
+                continue;
+            }
+
+            match which(&server.command) {
+                // ⚠️ **文件名在前、目录在下一行。**
+                //
+                // 一条路径被右边切掉时，先没的是**尾巴**，而尾巴恰恰是唯一
+                // 能认出「这是哪一个」的那一段（两条 `clangd` 的目录可能长得
+                // 几乎一样，区别只在最后）。实测过：一行到底的写法在 78 列的
+                // 终端里两条都显示成 `...clang+llvm-22.1.8-...` —— 表格看着
+                // 很整齐，但一点用都没有。
+                //
+                // 拆开之后，被切掉的只会是目录里最不重要的尾部。
+                Some(path) => {
+                    lines.push(format!(
+                        "    ok  {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    if let Some(dir) = path.parent() {
+                        lines.push(format!("        {}", dir.display()));
+                    }
+                }
+                // ⚠️ 这句话是**故意**写全的：只说「找不到」会让人去查 PATH 之外的东西
+                //    （比如「我扩展装了呀」）。把判据说出来，用户才知道该去改什么。
+                None => lines.push(format!(
+                    "    NOT on PATH -- the editor still works, but {} gets no diagnostics",
+                    server.extensions.join("/")
+                )),
+            }
+        }
+
+        lines.push(String::new());
+        if running.is_empty() {
+            // ⚠️ 空不等于「坏了」：服务器是**用到了才起**的，而且只在真文件上起 ——
+            //    所以停在目录列表里、或者这门语言的文件还没打开过，本来就该是空的。
+            lines.push(
+                "running now: none (servers start when a matching file is opened)".to_string(),
+            );
+        } else {
+            lines.push(format!("running now ({})", running.len()));
+            for (command, root) in running {
+                lines.push(format!("    {command}  @  {root}"));
+            }
+        }
+
+        lines.join("\n")
+    }
+
     /// 检查取值范围。越界就是**错误**（跟 `:set tabwidth 999` 一样会报错），
     /// 而不是悄悄夹到边界上——用户写错了应该知道。
     fn validate(&self) -> Result<(), String> {
@@ -1715,5 +1823,160 @@ extensions = ["zig"]
 
         assert!(err.contains("line 3"), "该指出第 3 行：{err}");
         assert!(err.contains("comand"), "该指出写错的键名：{err}");
+    }
+
+    // ---------- `:lsp` 那一屏 ----------
+
+    /// 造一份只含一条的配置，命令指哪儿由调用方说了算。
+    fn config_with(command: &str, extensions: &[&str]) -> Config {
+        let mut config = Config::default();
+        config.lsp.clear();
+        config.lsp.insert(
+            "zz".to_string(),
+            LspServer {
+                name: "zz".to_string(),
+                command: command.to_string(),
+                args: Vec::new(),
+                extensions: extensions.iter().map(|e| e.to_string()).collect(),
+                root_marker: None,
+                language_id: None,
+            },
+        );
+        config
+    }
+
+    /// 找得到的命令要报出**它的文件名和目录** —— 那是这张表的主要用处。
+    ///
+    /// ⚠️ 用**自己造的**绝对路径，不用 `clangd` / `rust-analyzer` 这种真名字：
+    /// 那样这条测试就变成了「这台机器装没装 clangd」，换台机器就红，
+    /// 而它要验的其实是「我们会不会把找到的位置说出来」。
+    /// （命令里带路径分隔符时不去翻 `PATH`，所以这条路是确定的。）
+    ///
+    /// ⚠️ 断言分成**两段**（文件名、目录）是刻意的 —— 它们**必须分两行**。
+    /// 一条到底的写法在窄终端里会被右边切掉，先没的正好是文件名，
+    /// 而那是唯一能认出「这是哪一个」的地方。
+    #[test]
+    fn the_lsp_list_says_where_the_command_was_found() {
+        let dir = std::env::temp_dir().join("stbd-lsp-status");
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let program = dir.join("my-server.exe");
+        std::fs::write(&program, "假装是个程序").expect("写临时文件");
+
+        let config = config_with(&program.to_string_lossy(), &["zz"]);
+        let text = config.lsp_status(&[]);
+
+        assert!(text.contains("zz"), "要列出节名和它管的扩展名：{text}");
+
+        // ⚠️ 盯的是 `ok` 那一行，**不是**「哪一行里出现了文件名」——
+        //    表头那行印的是**配置里原样写的**命令，而这里的命令本身就是
+        //    一条路径，于是文件名在表头里也出现了一次。找第一处会找错行
+        //    （第一版就是这么红的）。
+        let lines: Vec<&str> = text.lines().collect();
+        let ok_at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ok"))
+            .unwrap_or_else(|| panic!("该报「找得到」：{text}"));
+        assert!(
+            lines[ok_at].contains("my-server.exe"),
+            "要找得到就说清**是哪一个** —— 文件名得在这一行：{text}"
+        );
+        // 紧接着的下一行是目录 —— 而不是把整条路径挤在同一行里
+        assert_eq!(
+            lines.get(ok_at + 1).map(|line| line.trim()),
+            Some(dir.to_string_lossy().as_ref()),
+            "文件名之后该跟一行目录：{text}"
+        );
+        // 表头那行该是**配置里原样写的**东西：查「我改的配置生效了吗」全靠它
+        assert!(
+            lines[2].contains(&program.to_string_lossy().to_string()),
+            "表头该原样印出配置里写的命令：{text}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 找不到的命令要说 **on PATH** 这个词。
+    ///
+    /// 为什么非要这两个字：用户看到「找不到」的第一反应是「可我扩展装了呀」——
+    /// 而 VS Code 扩展打包在里面的服务器（pyright、jdtls）本来就不在 `PATH` 上。
+    /// 把判据说出来，他才知道该去改什么；只说「找不到」等于让他去查一个
+    /// 我们根本没看过的地方。
+    #[test]
+    fn a_missing_command_is_blamed_on_path_specifically() {
+        let config = config_with("definitely-not-a-real-program-9527", &["zz"]);
+        let text = config.lsp_status(&[]);
+
+        assert!(text.contains("PATH"), "要把判据说出来：{text}");
+        assert!(
+            text.contains("zz"),
+            "要说清「是哪门语言没诊断」——不然不知道影响的是什么：{text}"
+        );
+    }
+
+    /// `command = ""` = 这一条关掉了。清单必须**说出来**，不能只是一片空白。
+    ///
+    /// 它是「为什么这个文件没反应」的两个答案之一（另一个是没装/不在 PATH）。
+    /// 留白的话，用户手上就只剩「我明明写了配置呀」这一个线索。
+    #[test]
+    fn an_empty_command_is_reported_as_switched_off() {
+        let config = config_with("", &["zz"]);
+        let text = config.lsp_status(&[]);
+
+        assert!(text.contains("off"), "{text}");
+        // 关掉的条目**不该**顺带说一句「找不到」—— 那会把人往错的方向指
+        assert!(!text.contains("PATH"), "关掉不是「找不到」：{text}");
+    }
+
+    /// 「现在跑着几个」那一行：空的时候要说清**为什么**空。
+    ///
+    /// ⚠️ 空 ≠ 坏了：服务器是**用到了才起**的，而且只在真文件上起 ——
+    /// 停在目录列表里、或者这门语言的文件还没打开过，本来就该是空的。
+    /// 不说这句的话，「none」看起来就是「它没在工作」。
+    #[test]
+    fn an_empty_pool_says_none_but_explains_why() {
+        let text = config_with("", &["zz"]).lsp_status(&[]);
+
+        assert!(text.contains("none"), "{text}");
+        assert!(
+            text.contains("opened"),
+            "要说清「不是坏了，是还没打开这种文件」：{text}"
+        );
+    }
+
+    /// 有会话在跑时，要把**命令**和**是哪个项目**都列出来。
+    #[test]
+    fn a_running_server_is_listed_with_its_project() {
+        let running = vec![
+            ("clangd".to_string(), "file:///D:/a".to_string()),
+            ("rust-analyzer".to_string(), "file:///D:/b".to_string()),
+        ];
+        let text = config_with("", &["zz"]).lsp_status(&running);
+
+        assert!(text.contains("running now (2)"), "{text}");
+        assert!(text.contains("clangd"), "{text}");
+        assert!(text.contains("file:///D:/a"), "要说清是哪个项目：{text}");
+        assert!(text.contains("rust-analyzer"), "{text}");
+    }
+
+    /// ⚠️ 节名要**排过序**。`HashMap` 的遍历顺序是随机的 ——
+    /// 不排的话同一份配置每敲一次 `:lsp` 行序都不一样，
+    /// 而「行序莫名其妙在变」会让人以为自己改动了什么。
+    #[test]
+    fn the_lsp_list_is_sorted_and_never_changes_order() {
+        let config = Config::default();
+        let first = config.lsp_status(&[]);
+        for _ in 0..20 {
+            assert_eq!(config.lsp_status(&[]), first, "同一份配置不该给出两种行序");
+        }
+
+        // 而且顺序**确实**是按名字来的（不是碰巧稳定）
+        let order: Vec<&str> = first
+            .lines()
+            .filter(|line| line.starts_with(['c', 'r']))
+            .collect();
+        assert_eq!(
+            order.first().map(|l| l.split_whitespace().next()),
+            Some(Some("c"))
+        );
     }
 }
